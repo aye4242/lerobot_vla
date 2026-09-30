@@ -361,3 +361,68 @@ def test_inference_memory_requires_reset_before_batch_size_changes():
     policy.reset()
     history = policy._stack_inference_memory({"camera": torch.ones(1, 1)})["camera"]
     assert history.shape == (1, 3, 1)
+
+
+def test_pi05_metadata_prompt_is_opt_in():
+    from copy import deepcopy
+
+    from lerobot.lerobot_types import TransitionKey
+    from lerobot.policies.pi05.processor_pi05 import Pi05PrepareStateTokenizerProcessorStep
+    from lerobot.utils.constants import (
+        OBS_STATE,
+        PI05_METADATA_CONTROL_MODE,
+        PI05_METADATA_MISTAKE,
+        PI05_METADATA_QUALITY,
+        PI05_METADATA_SPEED_STEPS,
+    )
+
+    transition = {
+        TransitionKey.OBSERVATION: {OBS_STATE: torch.zeros(1, 4)},
+        TransitionKey.COMPLEMENTARY_DATA: {
+            "task": ["pick the cube"],
+            PI05_METADATA_SPEED_STEPS: torch.tensor([2000]),
+            PI05_METADATA_QUALITY: torch.tensor([5]),
+            PI05_METADATA_MISTAKE: torch.tensor([False]),
+            PI05_METADATA_CONTROL_MODE: ["joint"],
+        },
+    }
+    base_prompt = Pi05PrepareStateTokenizerProcessorStep()(deepcopy(transition))
+    base_prompt = base_prompt[TransitionKey.COMPLEMENTARY_DATA]["task"][0]
+    assert base_prompt == "Task: pick the cube, State: 128 128 128 128;\nAction: "
+
+    enriched = Pi05PrepareStateTokenizerProcessorStep(use_episode_metadata=True)(deepcopy(transition))
+    prompt = enriched[TransitionKey.COMPLEMENTARY_DATA]["task"][0]
+    assert "Speed: 2000 steps." in prompt
+    assert "Quality: 5." in prompt
+    assert "Mistake: false." in prompt
+    assert "Control Mode: joint." in prompt
+
+
+def test_pi05_metadata_sidecar_enriches_sample(tmp_path):
+    import json
+
+    from lerobot.datasets.pi05_metadata import PI05EpisodeMetadataDataset
+    from lerobot.utils.constants import (
+        PI05_METADATA_CONTROL_MODE,
+        PI05_METADATA_MISTAKE,
+        PI05_METADATA_QUALITY,
+        PI05_METADATA_SPEED_STEPS,
+    )
+
+    class SourceDataset:
+        def __len__(self):
+            return 1
+
+        def __getitem__(self, index):
+            return {"episode_index": torch.tensor(index)}
+
+    metadata_path = tmp_path / "metadata.json"
+    metadata_path.write_text(
+        json.dumps({"0": {"speed_steps": 2000, "quality": 5, "mistake": False, "control_mode": "joint"}}),
+        encoding="utf-8",
+    )
+    sample = PI05EpisodeMetadataDataset(SourceDataset(), metadata_path)[0]
+    assert sample[PI05_METADATA_SPEED_STEPS] == 2000
+    assert sample[PI05_METADATA_QUALITY] == 5
+    assert sample[PI05_METADATA_MISTAKE] is False
+    assert sample[PI05_METADATA_CONTROL_MODE] == "joint"

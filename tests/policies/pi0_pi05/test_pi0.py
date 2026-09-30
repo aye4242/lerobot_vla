@@ -27,8 +27,26 @@ from lerobot.policies.pi0 import (  # noqa: E402
     PI0Policy,
     make_pi0_pre_post_processors,  # noqa: E402
 )
+from lerobot.policies.pi0.modeling_pi0 import _set_module_tensor  # noqa: E402
 from lerobot.utils.random_utils import set_seed  # noqa: E402
 from tests.utils import require_cuda, require_hf_token  # noqa: E402
+
+
+def test_low_cpu_loader_casts_checkpoint_tensors_to_runtime_dtype():
+    module = torch.nn.Module()
+    module.register_parameter(
+        "weight", torch.nn.Parameter(torch.empty(2, device="meta", dtype=torch.float32))
+    )
+    module.register_buffer("scale", torch.empty(2, device="meta", dtype=torch.float32))
+
+    checkpoint_tensor = torch.ones(2, dtype=torch.bfloat16)
+    _set_module_tensor(module, "weight", checkpoint_tensor, torch.device("cpu"))
+    _set_module_tensor(module, "scale", checkpoint_tensor, torch.device("cpu"))
+
+    assert module.weight.device.type == "cpu"
+    assert module.weight.dtype == torch.float32
+    assert module.scale.device.type == "cpu"
+    assert module.scale.dtype == torch.float32
 
 
 @require_cuda

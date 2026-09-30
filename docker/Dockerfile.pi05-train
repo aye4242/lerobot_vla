@@ -1,0 +1,44 @@
+# Pi0.5 LoRA fine-tuning image for CUDA 12.8 / Blackwell GPUs.
+# Build: docker build -f docker/Dockerfile.pi05-train -t mujoco-huanghb .
+
+ARG CUDA_VERSION=12.8.1
+ARG OS_VERSION=24.04
+FROM nvidia/cuda:${CUDA_VERSION}-base-ubuntu${OS_VERSION}
+
+ARG PYTHON_VERSION=3.12
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    MUJOCO_GL=egl \
+    PATH=/lerobot/.venv/bin:$PATH
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential ca-certificates cmake curl ffmpeg git libegl1 libgeos-dev \
+    libgl1 libglib2.0-0 libusb-1.0-0-dev ninja-build pkg-config portaudio19-dev \
+    python${PYTHON_VERSION} python${PYTHON_VERSION}-dev python${PYTHON_VERSION}-venv \
+    speech-dispatcher \
+    && curl -LsSf https://astral.sh/uv/install.sh | sh \
+    && mv /root/.local/bin/uv /usr/local/bin/uv \
+    && useradd --create-home --shell /bin/bash user_lerobot \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /lerobot
+RUN chown -R user_lerobot:user_lerobot /lerobot
+USER user_lerobot
+
+ENV HOME=/home/user_lerobot \
+    HF_HOME=/home/user_lerobot/.cache/huggingface \
+    HF_LEROBOT_HOME=/home/user_lerobot/.cache/huggingface/lerobot \
+    TORCH_HOME=/home/user_lerobot/.cache/torch \
+    TRITON_CACHE_DIR=/home/user_lerobot/.cache/triton
+
+RUN uv venv --python python${PYTHON_VERSION}
+
+COPY --chown=user_lerobot:user_lerobot setup.py pyproject.toml uv.lock README.md MANIFEST.in ./
+RUN uv sync --locked --extra training --extra pi --extra peft --no-install-project --no-cache
+
+COPY --chown=user_lerobot:user_lerobot . .
+RUN uv sync --locked --extra training --extra pi --extra peft --no-cache \
+    && find /lerobot/.venv -path '*/triton/backends/nvidia/bin/ptxas' -type f -exec chmod +x {} +
+
+CMD ["/bin/bash"]

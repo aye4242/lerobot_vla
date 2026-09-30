@@ -42,6 +42,7 @@ from .io_utils import load_episodes, write_stats
 from .language import EVENT_ONLY_STYLES, PERSISTENT_STYLES, STYLE_REGISTRY, column_for_style
 from .lerobot_dataset import LeRobotDataset
 from .multi_dataset import MultiLeRobotDataset
+from .pi05_metadata import PI05EpisodeMetadataDataset, load_pi05_episode_metadata
 from .pipeline_features import aggregate_pipeline_dataset_features, create_initial_features
 from .pyav_utils import check_video_encoder_parameters_pyav, detect_available_encoders_pyav
 from .sampler import EpisodeAwareSampler, compute_sampler_state
@@ -64,6 +65,7 @@ __all__ = [
     "LeRobotDataset",
     "LeRobotDatasetMetadata",
     "MultiLeRobotDataset",
+    "PI05EpisodeMetadataDataset",
     "PERSISTENT_STYLES",
     "STYLE_REGISTRY",
     "StreamingLeRobotDataset",
@@ -83,6 +85,7 @@ __all__ = [
     "delete_episodes",
     "get_feature_stats",
     "load_episodes",
+    "load_pi05_episode_metadata",
     "make_dataset",
     "make_train_eval_datasets",
     "merge_datasets",

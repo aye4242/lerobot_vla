@@ -330,6 +330,10 @@ class LiberoEnv(EnvConfig):
     camera_name: str = "agentview_image,robot0_eye_in_hand_image"
     init_states: bool = True
     hard_reset: bool = True
+    # Batch evaluation expects completed sub-environments to reset immediately.
+    # Interactive viewers can disable this to inspect the final success state.
+    auto_reset_on_termination: bool = True
+    terminate_on_success: bool = True
     camera_name_mapping: dict[str, str] | None = None
     observation_height: int = 360
     observation_width: int = 360
@@ -421,6 +425,8 @@ class LiberoEnv(EnvConfig):
             "observation_width": self.observation_width,
             "control_freq": self.fps,
             "hard_reset": self.hard_reset,
+            "auto_reset_on_termination": self.auto_reset_on_termination,
+            "terminate_on_success": self.terminate_on_success,
         }
         if self.task_ids is not None:
             kwargs["task_ids"] = self.task_ids
@@ -593,6 +599,9 @@ class VLABenchEnv(EnvConfig):
     render_resolution: tuple[int, int] = (480, 480)
     robot: str = "franka"
     action_mode: str = "eef"
+    deterministic_track: str | None = None
+    track_seed_offset: int = 1000
+    lift_height_threshold: float = 0.05
     features: dict[str, PolicyFeature] = field(
         default_factory=lambda: {
             ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,)),
@@ -631,6 +640,9 @@ class VLABenchEnv(EnvConfig):
             "robot": self.robot,
             "max_episode_steps": self.episode_length,
             "action_mode": self.action_mode,
+            "deterministic_track": self.deterministic_track,
+            "track_seed_offset": self.track_seed_offset,
+            "lift_height_threshold": self.lift_height_threshold,
         }
 
     def create_envs(self, n_envs: int, use_async_envs: bool = False):

@@ -159,27 +159,32 @@ def infer_groot_n1_7_action_horizon(
     processor_config = read_json(processor_config_path)
 
     processor_kwargs = processor_config.get("processor_kwargs", {})
-    if not isinstance(processor_kwargs, dict):
-        return None
-    modality_configs = processor_kwargs.get("modality_configs", {})
-    if not isinstance(modality_configs, dict):
-        return None
+    modality_configs = (
+        processor_kwargs.get("modality_configs", {}) if isinstance(processor_kwargs, dict) else {}
+    )
 
     if embodiment_tag is None:
         embodiment_tag = infer_groot_n1_7_embodiment_tag(model_path)
-    if embodiment_tag is None:
-        return None
 
-    embodiment_config = modality_configs.get(embodiment_tag, {})
-    if not isinstance(embodiment_config, dict):
-        return None
-    action_config = embodiment_config.get("action", {})
-    if not isinstance(action_config, dict):
-        return None
-    delta_indices = action_config.get("delta_indices", [])
-    if not isinstance(delta_indices, list):
-        return None
-    return len(delta_indices) or None
+    if embodiment_tag is not None and isinstance(modality_configs, dict):
+        embodiment_config = modality_configs.get(embodiment_tag, {})
+        if isinstance(embodiment_config, dict):
+            action_config = embodiment_config.get("action", {})
+            if isinstance(action_config, dict):
+                delta_indices = action_config.get("delta_indices", [])
+                if isinstance(delta_indices, list) and delta_indices:
+                    return len(delta_indices)
+
+    # LeRobot fine-tuned checkpoints serialize the native horizon in config.json
+    # instead of the raw NVIDIA processor_config.json modality structure.
+    config = read_json(Path(model_path).expanduser() / "config.json")
+    if config.get("type") == "groot":
+        config_embodiment = config.get("embodiment_tag")
+        if embodiment_tag is None or config_embodiment == embodiment_tag:
+            chunk_size = config.get("chunk_size")
+            if isinstance(chunk_size, int) and chunk_size > 0:
+                return chunk_size
+    return None
 
 
 def infer_groot_n1_7_action_execution_horizon(

@@ -227,6 +227,22 @@ class GrootPolicy(PreTrainedPolicy):
         if is_finetuned_checkpoint:
             # This is a fine-tuned LeRobot checkpoint - use parent class loading
             logger.info("Detected fine-tuned LeRobot checkpoint, loading with state dict...")
+            if config is None:
+                config = GrootConfig.from_pretrained(
+                    pretrained_name_or_path=pretrained_name_or_path,
+                    force_download=force_download,
+                    resume_download=resume_download,
+                    proxies=proxies,
+                    token=token,
+                    cache_dir=cache_dir,
+                    local_files_only=local_files_only,
+                    revision=revision,
+                    **kwargs,
+                )
+            # Saved training configs can contain a machine-local base-model snapshot.
+            # The LeRobot checkpoint is self-contained, so construct the wrapped model
+            # from the checkpoint being loaded rather than that stale source path.
+            config.base_model_path = model_id
             return super().from_pretrained(
                 pretrained_name_or_path=pretrained_name_or_path,
                 config=config,

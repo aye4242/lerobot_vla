@@ -39,6 +39,8 @@ class EvalPipelineConfig:
     seed: int | None = 1000
     # Rename map for the observation to override the image and state keys
     rename_map: dict[str, str] = field(default_factory=dict)
+    # Optional local tokenizer directory overriding the tokenizer stored in a policy processor config.
+    tokenizer_path: Path | None = None
     # Explicit consent to execute remote code from the Hub (required for hub environments).
     trust_remote_code: bool = False
 

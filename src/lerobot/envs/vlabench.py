@@ -26,9 +26,12 @@ with long-horizon reasoning, built on MuJoCo/dm_control.
 from __future__ import annotations
 
 import contextlib
+import copy
+import json
 import logging
 from collections import defaultdict
 from collections.abc import Callable, Sequence
+from pathlib import Path
 from typing import Any
 
 import cv2
@@ -107,6 +110,80 @@ SUITE_TASKS: dict[str, list[str]] = {
 }
 
 
+def _resolve_camera_frame_indices(camera_names: Sequence[str], frame_count: int) -> dict[str, int | None]:
+    """Map LeRobot image keys to the camera semantics used by vlabench_unified.
+
+    VLABench exposes Franka cameras in the order right, left, forward, wrist,
+    while the training dataset stores forward, right, wrist as image,
+    second_image, wrist_image respectively.
+    """
+    normalized_names = [name.lower().rsplit("/", 1)[-1] for name in camera_names]
+
+    def find_camera(*tokens: str) -> int | None:
+        for index, name in enumerate(normalized_names):
+            if index < frame_count and any(token in name for token in tokens):
+                return index
+        return None
+
+    # Numeric fallbacks match VLABench's standard Franka camera order. For
+    # older/custom models with fewer cameras, retain the first available views.
+    fallbacks = {
+        "image": 2 if frame_count >= 3 else (0 if frame_count else None),
+        "second_image": 0 if frame_count else None,
+        "wrist_image": 3 if frame_count >= 4 else (2 if frame_count >= 3 else None),
+    }
+    resolved = {
+        "image": find_camera("forward", "front"),
+        "second_image": find_camera("right"),
+        "wrist_image": find_camera("wrist"),
+    }
+    return {key: index if index is not None else fallbacks[key] for key, index in resolved.items()}
+
+
+def _extract_task_description(task_obj: Any, fallback: str) -> str:
+    """Return the natural-language instruction exposed by a VLABench task."""
+    get_instruction = getattr(task_obj, "get_instruction", None)
+    if callable(get_instruction):
+        instruction = get_instruction()
+        if isinstance(instruction, str) and instruction.strip():
+            return instruction.strip()
+
+    for attr in ("task_description", "language_instruction", "instructions"):
+        instruction = getattr(task_obj, attr, None)
+        if isinstance(instruction, str) and instruction.strip():
+            return instruction.strip()
+        if isinstance(instruction, (list, tuple)):
+            for item in instruction:
+                if isinstance(item, str) and item.strip():
+                    return item.strip()
+
+    return fallback
+
+
+def _load_deterministic_episode_configs(track_path: str, task: str) -> list[dict[str, Any]]:
+    path = Path(track_path).expanduser()
+    if not path.is_file():
+        raise FileNotFoundError(f"VLABench deterministic track not found: {path}")
+    with path.open(encoding="utf-8") as track_file:
+        track = json.load(track_file)
+    episodes = track.get(task)
+    if not isinstance(episodes, list) or not episodes:
+        raise ValueError(f"Track {path} does not contain episode configs for task '{task}'.")
+    if not all(isinstance(episode, dict) and isinstance(episode.get("task"), dict) for episode in episodes):
+        raise ValueError(f"Track {path} contains malformed episode configs for task '{task}'.")
+    return episodes
+
+
+def _episode_index_from_seed(seed: int | None, seed_offset: int, episode_count: int, fallback: int) -> int:
+    episode_index = fallback % episode_count if seed is None else seed - seed_offset
+    if not 0 <= episode_index < episode_count:
+        raise ValueError(
+            f"Deterministic track episode index {episode_index} is outside [0, {episode_count - 1}]. "
+            f"Use seeds starting at track_seed_offset={seed_offset}."
+        )
+    return episode_index
+
+
 class VLABenchEnv(gym.Env):
     """Gymnasium wrapper for VLABench environments.
 
@@ -125,6 +202,9 @@ class VLABenchEnv(gym.Env):
         robot: str = "franka",
         max_episode_steps: int = DEFAULT_MAX_EPISODE_STEPS,
         action_mode: str = "eef",
+        deterministic_track: str | None = None,
+        track_seed_offset: int = 1000,
+        lift_height_threshold: float = 0.05,
     ):
         super().__init__()
         self.task = task
@@ -134,6 +214,14 @@ class VLABenchEnv(gym.Env):
         self.robot = robot
         self._max_episode_steps = max_episode_steps
         self.action_mode = action_mode
+        self.deterministic_track = deterministic_track
+        self.track_seed_offset = track_seed_offset
+        self.lift_height_threshold = lift_height_threshold
+        self._episode_configs = (
+            _load_deterministic_episode_configs(deterministic_track, task) if deterministic_track else None
+        )
+        self._next_episode_index = 0
+        self.episode_config_index = -1
 
         # Deferred — created on first reset() inside worker subprocess to avoid
         # inheriting stale GPU/EGL contexts when AsyncVectorEnv spawns workers.
@@ -142,6 +230,10 @@ class VLABenchEnv(gym.Env):
         # refetch it via `self._env.physics` at the call site.
         self._env = None
         self.task_description = ""  # populated on first reset
+        self.target_entity = ""
+        self.target_container = ""
+        self._initial_target_z: float | None = None
+        self._stage_metrics: dict[str, Any] = {}
         # Cached world-frame XYZ of the robot base link. The VLABench datasets
         # log both `observation.state` positions and `actions` positions in
         # robot-base frame (see VLABench/scripts/convert_to_lerobot.py which
@@ -195,7 +287,7 @@ class VLABenchEnv(gym.Env):
     # to need >>5 retries, so we pick a generous ceiling.
     _ENSURE_ENV_MAX_ATTEMPTS = 20
 
-    def _ensure_env(self) -> None:
+    def _ensure_env(self, episode_config: dict[str, Any] | None = None) -> None:
         """Create the underlying VLABench env on first use.
 
         Called inside the worker subprocess after fork(), so each worker gets
@@ -224,7 +316,14 @@ class VLABenchEnv(gym.Env):
         last_exc: PhysicsError | None = None
         for attempt in range(1, self._ENSURE_ENV_MAX_ATTEMPTS + 1):
             try:
-                env = load_env(task=self.task, robot=self.robot, render_resolution=(h, w))
+                env = load_env(
+                    task=self.task,
+                    robot=self.robot,
+                    render_resolution=(h, w),
+                    episode_config=copy.deepcopy(episode_config),
+                    random_init=False,
+                    run_mode="eval",
+                )
                 self._env = env
                 break
             except PhysicsError as exc:
@@ -247,14 +346,11 @@ class VLABenchEnv(gym.Env):
                 f"from the eval set. Last physics error: {last_exc}"
             ) from last_exc
 
-        # Extract task description from the dm_control task
+        # VLABench exposes generated instructions through get_instruction().
+        # Older integrations may instead expose one of the attribute forms.
         task_obj = self._env.task
-        if hasattr(task_obj, "task_description"):
-            self.task_description = task_obj.task_description
-        elif hasattr(task_obj, "language_instruction"):
-            self.task_description = task_obj.language_instruction
-        else:
-            self.task_description = self.task
+        self.task_description = _extract_task_description(task_obj, self.task)
+        logger.info("VLABench instruction | task=%s | instruction=%r", self.task, self.task_description)
 
         # Cache robot base world position so `_build_ctrl_from_action` and
         # `_get_obs` can translate between robot-frame (dataset) and
@@ -266,6 +362,83 @@ class VLABenchEnv(gym.Env):
         except Exception:
             # Fallback to VLABench's default Franka base position.
             self._robot_base_xyz = np.array([0.0, -0.4, 0.78], dtype=np.float64)
+
+    @staticmethod
+    def _single_target_name(value: Any) -> str:
+        if isinstance(value, str):
+            return value
+        if isinstance(value, (list, tuple)) and len(value) == 1 and isinstance(value[0], str):
+            return value[0]
+        return ""
+
+    def _target_position(self) -> np.ndarray | None:
+        if self._env is None or not self.target_entity:
+            return None
+        entity = getattr(self._env.task, "entities", {}).get(self.target_entity)
+        if entity is None or not hasattr(entity, "get_xpos"):
+            return None
+        with contextlib.suppress(Exception):
+            return np.asarray(entity.get_xpos(self._env.physics), dtype=np.float64).reshape(3)
+        return None
+
+    def _reset_stage_metrics(self) -> None:
+        assert self._env is not None
+        task_obj = self._env.task
+        self.target_entity = self._single_target_name(getattr(task_obj, "target_entity", ""))
+        self.target_container = self._single_target_name(getattr(task_obj, "target_container", ""))
+        target_pos = self._target_position()
+        self._initial_target_z = None if target_pos is None else float(target_pos[2])
+        self._stage_metrics = {
+            "stage_target_reached": False,
+            "stage_target_grasped": False,
+            "stage_target_lifted": False,
+            "stage_wrong_object_grasped": False,
+            "min_eef_target_distance_m": None,
+            "max_target_lift_m": 0.0,
+        }
+        self._update_stage_metrics()
+
+    def _update_stage_metrics(self) -> None:
+        if self._env is None:
+            return
+        target_pos = self._target_position()
+        if target_pos is not None:
+            with contextlib.suppress(Exception):
+                eef_pos = np.asarray(self._env.robot.get_end_effector_pos(self._env.physics), dtype=np.float64)
+                distance = float(np.linalg.norm(eef_pos - target_pos))
+                previous = self._stage_metrics["min_eef_target_distance_m"]
+                self._stage_metrics["min_eef_target_distance_m"] = (
+                    distance if previous is None else min(previous, distance)
+                )
+                self._stage_metrics["stage_target_reached"] |= distance <= 0.10
+            if self._initial_target_z is not None:
+                lift = max(0.0, float(target_pos[2]) - self._initial_target_z)
+                self._stage_metrics["max_target_lift_m"] = max(
+                    self._stage_metrics["max_target_lift_m"], lift
+                )
+
+        with contextlib.suppress(Exception):
+            grasped_names, _ = self._env.get_grasped_entity()
+            self._stage_metrics["stage_target_grasped"] |= self.target_entity in grasped_names
+            self._stage_metrics["stage_wrong_object_grasped"] |= any(
+                name != self.target_entity for name in grasped_names
+            )
+        self._stage_metrics["stage_target_lifted"] |= bool(
+            self._stage_metrics["stage_target_grasped"]
+            and self._stage_metrics["max_target_lift_m"] >= self.lift_height_threshold
+        )
+
+    def _episode_info(self, is_success: bool = False) -> dict[str, Any]:
+        return {
+            "task": self.task,
+            "instruction": self.task_description,
+            "target_entity": self.target_entity,
+            "target_container": self.target_container,
+            "episode_config_index": self.episode_config_index,
+            **self._stage_metrics,
+            "stage_placed": is_success,
+            "is_success": is_success,
+        }
 
     def _get_obs(self) -> dict:
         """Get current observation from the environment."""
@@ -308,11 +481,18 @@ class VLABenchEnv(gym.Env):
                 elif rgb.ndim == 3:
                     raw_frames = [rgb]
 
+        camera_names: list[str] = []
+        with contextlib.suppress(Exception):
+            model = self._env.physics.model
+            camera_names = [model.cam(i).name or "" for i in range(model.ncam)]
+        frame_indices = _resolve_camera_frame_indices(camera_names, len(raw_frames))
+
         image_keys = ["image", "second_image", "wrist_image"]
         images: dict[str, np.ndarray] = {}
-        for i, key in enumerate(image_keys):
-            if i < len(raw_frames):
-                images[key] = _to_hwc3(raw_frames[i])
+        for key in image_keys:
+            frame_index = frame_indices[key]
+            if frame_index is not None and frame_index < len(raw_frames):
+                images[key] = _to_hwc3(raw_frames[frame_index])
             else:
                 images[key] = np.zeros((h, w, 3), dtype=np.uint8)
 
@@ -422,17 +602,41 @@ class VLABenchEnv(gym.Env):
         return ctrl
 
     def reset(self, seed=None, **kwargs) -> tuple[RobotObservation, dict[str, Any]]:
-        self._ensure_env()
-        assert self._env is not None
         super().reset(seed=seed)
+
+        episode_config = None
+        if self._episode_configs is not None:
+            fallback_index = self.episode_config_index if self.episode_config_index >= 0 else self._next_episode_index
+            episode_index = _episode_index_from_seed(
+                seed, self.track_seed_offset, len(self._episode_configs), fallback_index
+            )
+            self._next_episode_index = episode_index + 1
+            self.episode_config_index = episode_index
+            episode_config = self._episode_configs[episode_index]
+            if self._env is not None:
+                self._env.close()
+                self._env = None
+                self._robot_base_xyz = None
+
+        self._ensure_env(episode_config)
+        assert self._env is not None
 
         if seed is not None:
             self._seed_inner_env(int(self.np_random.integers(0, 2**31 - 1)))
 
         self._env.reset()
+        self.task_description = _extract_task_description(self._env.task, self.task)
+        self._reset_stage_metrics()
 
         observation = self._get_obs()
-        info = {"is_success": False}
+        info = self._episode_info()
+        logger.info(
+            "VLABench episode | config_index=%d | instruction=%r | target=%s | container=%s",
+            self.episode_config_index,
+            self.task_description,
+            self.target_entity,
+            self.target_container,
+        )
         return observation, info
 
     def _seed_inner_env(self, seed: int) -> None:
@@ -480,7 +684,7 @@ class VLABenchEnv(gym.Env):
                 exc,
             )
             observation = self._get_obs()
-            info = {"task": self.task, "is_success": False, "physics_error": True}
+            info = {**self._episode_info(), "physics_error": True}
             # Drop the stale env so the next reset() rebuilds it cleanly.
             with contextlib.suppress(Exception):
                 self._env.close()
@@ -489,6 +693,7 @@ class VLABenchEnv(gym.Env):
 
         # Extract reward from dm_control timestep
         reward = float(timestep.reward) if timestep.reward is not None else 0.0
+        self._update_stage_metrics()
 
         # Check success via the task's termination condition
         is_success = False
@@ -497,15 +702,9 @@ class VLABenchEnv(gym.Env):
 
         terminated = is_success
         truncated = False
-        info = {
-            "task": self.task,
-            "is_success": is_success,
-        }
+        info = self._episode_info(is_success)
 
         observation = self._get_obs()
-
-        if terminated:
-            self.reset()
 
         return observation, reward, terminated, truncated, info
 

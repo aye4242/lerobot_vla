@@ -32,6 +32,16 @@ class PI05Config(PreTrainedConfig):
     action_expert_variant: str = "gemma_300m"
     dtype: str = "float32"  # Options: "bfloat16", "float32"
 
+    # Optional pi0.7-style episode conditioning. Disabled to preserve the
+    # original pi0.5 prompt and checkpoint behavior.
+    use_episode_metadata: bool = False
+    episode_metadata_path: str | None = None
+    metadata_missing_policy: str = "error"  # "error" or "omit"
+    metadata_default_speed_steps: int | None = None
+    metadata_default_quality: int | None = None
+    metadata_default_mistake: bool | None = None
+    metadata_default_control_mode: str | None = None
+
     n_obs_steps: int = 1
     chunk_size: int = 50  # Number of action steps to predict, in openpi called "action_horizon"
     n_action_steps: int = 50  # Number of action steps to execute
@@ -142,6 +152,17 @@ class PI05Config(PreTrainedConfig):
         if self.dtype not in ["bfloat16", "float32"]:
             raise ValueError(f"Invalid dtype: {self.dtype}")
 
+        if self.metadata_missing_policy not in {"error", "omit"}:
+            raise ValueError(
+                "metadata_missing_policy must be either 'error' or 'omit', "
+                f"got {self.metadata_missing_policy!r}"
+            )
+        if self.metadata_default_speed_steps is not None and self.metadata_default_speed_steps <= 0:
+            raise ValueError("metadata_default_speed_steps must be positive")
+        if self.metadata_default_quality is not None and not 1 <= self.metadata_default_quality <= 5:
+            raise ValueError("metadata_default_quality must be between 1 and 5")
+        if self.metadata_default_control_mode not in {None, "joint", "ee", "end_effector"}:
+            raise ValueError("metadata_default_control_mode must be 'joint', 'ee', or 'end_effector'")
         if self.memory_frames < 1:
             raise ValueError("memory_frames must be at least 1")
         if self.memory_stride < 1:

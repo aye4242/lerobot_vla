@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 import gymnasium as gym
+import mujoco
 import numpy as np
 import torch
 from gymnasium import spaces
@@ -129,6 +130,8 @@ class LiberoEnv(gym.Env):
         control_mode: str = "relative",
         is_libero_plus: bool = False,
         hard_reset: bool = True,
+        auto_reset_on_termination: bool = True,
+        terminate_on_success: bool = True,
     ):
         super().__init__()
         if control_freq <= 0:
@@ -164,6 +167,11 @@ class LiberoEnv(gym.Env):
         self.hard_reset = hard_reset
         self.episode_index = episode_index
         self.episode_length = episode_length
+        self.auto_reset_on_termination = auto_reset_on_termination
+        self.terminate_on_success = terminate_on_success
+        self._free_camera_initialized = False
+        self._robot_home_qpos: np.ndarray | None = None
+        self._robot_home_gripper_qpos: np.ndarray | None = None
         # Load once and keep
         self._init_states = (
             get_task_init_states(task_suite, self.task_id, is_libero_plus=self.is_libero_plus)
@@ -284,6 +292,148 @@ class LiberoEnv(gym.Env):
         image = image[::-1, ::-1]  # flip both H and W for visualization
         return image
 
+    def render_free_camera(self) -> np.ndarray:
+        """Render an observer-only free camera without changing policy observations."""
+        self._ensure_env()
+        assert self._env is not None
+        sim = self._env.env.sim
+        context = sim._render_context_offscreen
+        if context is None:
+            # Camera observations normally create this context during reset. Keep
+            # this fallback for configurations that do not request image inputs.
+            from robosuite.utils.binding_utils import MjRenderContextOffscreen
+
+            context = MjRenderContextOffscreen(sim, device_id=-1)
+        if not self._free_camera_initialized:
+            mujoco.mjv_defaultFreeCamera(sim.model._model, context.cam)
+            self._free_camera_initialized = True
+        context.render(
+            width=self.visualization_width,
+            height=self.visualization_height,
+            camera_id=-1,
+        )
+        return context.read_pixels(self.visualization_width, self.visualization_height)[::-1]
+
+    def move_free_camera(self, action: str, rel_x: float, rel_y: float) -> None:
+        """Move the observer camera using MuJoCo's native camera controls."""
+        self._ensure_env()
+        assert self._env is not None
+        sim = self._env.env.sim
+        context = sim._render_context_offscreen
+        if context is None:
+            self.render_free_camera()
+            context = sim._render_context_offscreen
+        assert context is not None
+        if not self._free_camera_initialized:
+            mujoco.mjv_defaultFreeCamera(sim.model._model, context.cam)
+            self._free_camera_initialized = True
+        mouse_actions = {
+            "rotate_h": mujoco.mjtMouse.mjMOUSE_ROTATE_H,
+            "rotate_v": mujoco.mjtMouse.mjMOUSE_ROTATE_V,
+            "move_h": mujoco.mjtMouse.mjMOUSE_MOVE_H,
+            "move_v": mujoco.mjtMouse.mjMOUSE_MOVE_V,
+            "zoom": mujoco.mjtMouse.mjMOUSE_ZOOM,
+        }
+        try:
+            mouse_action = mouse_actions[action]
+        except KeyError as exc:
+            raise ValueError(f"Unknown free-camera action: {action}") from exc
+        mujoco.mjv_moveCamera(
+            sim.model._model,
+            mouse_action,
+            float(rel_x),
+            float(rel_y),
+            context.scn,
+            context.cam,
+        )
+
+    def reset_free_camera(self) -> None:
+        """Restore MuJoCo's default observer camera framing."""
+        self._ensure_env()
+        assert self._env is not None
+        context = self._env.env.sim._render_context_offscreen
+        if context is not None:
+            mujoco.mjv_defaultFreeCamera(self._env.env.sim.model._model, context.cam)
+            self._free_camera_initialized = True
+
+    def get_scene_objects(self) -> list[dict[str, str]]:
+        """Return movable object names and instance ids from the active BDDL scene."""
+        self._ensure_env()
+        assert self._env is not None
+        scene_objects: list[dict[str, str]] = []
+        for category, instances in self._env.env.parsed_problem["objects"].items():
+            if category == "basket":
+                continue
+            for instance in instances:
+                scene_objects.append(
+                    {
+                        "name": category.replace("_", " "),
+                        "instance": instance,
+                    }
+                )
+        return scene_objects
+
+    def is_object_in_basket(self, object_instance: str) -> bool:
+        """Evaluate LIBERO's native In predicate for an arbitrary scene object."""
+        self._ensure_env()
+        assert self._env is not None
+        inner_env = self._env.env
+        if object_instance not in inner_env.object_states_dict:
+            raise ValueError(f"Unknown LIBERO object instance: {object_instance}")
+        basket_regions = [
+            name
+            for name in inner_env.object_states_dict
+            if name.startswith("basket_") and name.endswith("_contain_region")
+        ]
+        if len(basket_regions) != 1:
+            raise RuntimeError(f"Expected one basket contain region, found: {basket_regions}")
+        return bool(inner_env._eval_predicate(["in", object_instance, basket_regions[0]]))
+
+    def _basket_progress(self) -> dict[str, bool]:
+        """Return native LIBERO ``In`` results for every movable object when a basket exists."""
+        self._ensure_env()
+        assert self._env is not None
+        inner_env = self._env.env
+        basket_regions = [
+            name
+            for name in inner_env.object_states_dict
+            if name.startswith("basket_") and name.endswith("_contain_region")
+        ]
+        if len(basket_regions) != 1:
+            return {}
+
+        object_instances = [
+            instance
+            for category, instances in inner_env.parsed_problem["objects"].items()
+            if category != "basket"
+            for instance in instances
+        ]
+        return {
+            instance: bool(inner_env._eval_predicate(["in", instance, basket_regions[0]]))
+            for instance in object_instances
+        }
+
+    def return_robot_home(self, release_steps: int = 5) -> None:
+        """Restore only the robot and gripper while preserving all scene objects."""
+        self._ensure_env()
+        assert self._env is not None
+        if self._robot_home_qpos is None or self._robot_home_gripper_qpos is None:
+            raise RuntimeError("Robot home state is unavailable before the first reset")
+
+        for _ in range(max(int(release_steps), 0)):
+            self._env.step(get_libero_dummy_action())
+
+        robot = self._env.robots[0]
+        sim = self._env.env.sim
+        sim.data.qpos[robot._ref_joint_pos_indexes] = self._robot_home_qpos
+        sim.data.qvel[robot._ref_joint_vel_indexes] = 0.0
+        sim.data.qpos[robot._ref_gripper_joint_pos_indexes] = self._robot_home_gripper_qpos
+        sim.data.qvel[robot._ref_gripper_joint_vel_indexes] = 0.0
+        sim.data.ctrl[robot._ref_joint_actuator_indexes] = 0.0
+        sim.data.ctrl[robot._ref_joint_gripper_actuator_indexes] = 0.0
+        sim.forward()
+        robot.controller.update_initial_joints(self._robot_home_qpos)
+
     def _format_raw_obs(self, raw_obs: RobotObservation) -> RobotObservation:
         assert self._env is not None, "_format_raw_obs called before _ensure_env()"
         images = {}
@@ -359,6 +509,14 @@ class LiberoEnv(gym.Env):
                 robot.controller.use_delta = True
         else:
             raise ValueError(f"Invalid control mode: {self.control_mode}")
+        robot = self._env.robots[0]
+        sim = self._env.env.sim
+        self._robot_home_qpos = np.asarray(
+            sim.data.qpos[robot._ref_joint_pos_indexes], dtype=np.float64
+        ).copy()
+        self._robot_home_gripper_qpos = np.asarray(
+            sim.data.qpos[robot._ref_gripper_joint_pos_indexes], dtype=np.float64
+        ).copy()
         observation = self._format_raw_obs(raw_obs)
         info = {"is_success": False}
         return observation, info
@@ -374,19 +532,24 @@ class LiberoEnv(gym.Env):
         raw_obs, reward, done, info = self._env.step(action)
 
         is_success = self._env.check_success()
-        terminated = done or is_success
+        objects_in_basket = self._basket_progress()
+        # LIBERO overrides its raw `done` with the BDDL success predicate. In
+        # interactive mode we deliberately keep stepping after that predicate.
+        terminated = bool(done or is_success) if self.terminate_on_success else False
         info.update(
             {
                 "task": self.task,
                 "task_id": self.task_id,
                 "done": done,
                 "is_success": is_success,
+                "objects_in_basket": objects_in_basket,
+                "objects_in_basket_count": sum(objects_in_basket.values()),
             }
         )
         observation = self._format_raw_obs(raw_obs)
-        # Return the terminal observation unchanged. The caller owns resetting after
-        # termination; vector envs created below use NEXT_STEP autoreset. Resetting here
-        # would therefore reset twice and skip an initial state.
+        # Note: for vector envs using NEXT_STEP autoreset, set auto_reset_on_termination=False to avoid double-reset.
+        if terminated and self.auto_reset_on_termination:
+            self.reset()
         truncated = False
         return observation, reward, terminated, truncated, info
 

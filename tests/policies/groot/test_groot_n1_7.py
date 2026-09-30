@@ -2663,6 +2663,24 @@ def test_groot_n1_7_libero_execution_horizon_uses_core_eight_action_cadence(tmp_
     assert infer_groot_n1_7_action_execution_horizon(model_path, "libero_sim") == 8
 
 
+def test_groot_n1_7_lerobot_checkpoint_uses_config_action_horizon(tmp_path):
+    model_path = tmp_path / "lerobot_libero"
+    model_path.mkdir()
+    (model_path / "config.json").write_text(
+        json.dumps(
+            {
+                "type": "groot",
+                "model_version": "n1.7",
+                "embodiment_tag": "libero_sim",
+                "chunk_size": 16,
+            }
+        )
+    )
+
+    assert infer_groot_n1_7_action_horizon(model_path, "libero_sim") == 16
+    assert infer_groot_n1_7_action_execution_horizon(model_path, "libero_sim") == 8
+
+
 def test_groot_select_action_rejects_relative_action_policies():
     policy = object.__new__(GrootPolicy)
     object.__setattr__(policy, "config", SimpleNamespace(use_relative_actions=True))

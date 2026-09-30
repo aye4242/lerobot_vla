@@ -14,7 +14,6 @@
 # keys
 import os
 from pathlib import Path
-from typing import Final
 
 from huggingface_hub.constants import HF_HOME
 
@@ -50,12 +49,12 @@ INFO = "info"
 QUERY_KIND = "query_kind"
 QUERY_TEXT = "query_text"
 
-# Raw semantic-language dataset columns. These live here so lightweight policy
-# processors do not need to import the optional datasets/pyarrow stack.
-LANGUAGE_PERSISTENT: Final = "language_persistent"
-LANGUAGE_EVENTS: Final = "language_events"
-MESSAGES_RENDERED = "messages_rendered"
-
+# Optional episode-level conditioning fields used by the incremental PI05
+# metadata experiment. They stay outside registered robot features.
+PI05_METADATA_SPEED_STEPS = "pi05_metadata_speed_steps"
+PI05_METADATA_QUALITY = "pi05_metadata_quality"
+PI05_METADATA_MISTAKE = "pi05_metadata_mistake"
+PI05_METADATA_CONTROL_MODE = "pi05_metadata_control_mode"
 ROBOTS = "robots"
 TELEOPERATORS = "teleoperators"
 
@@ -70,7 +69,6 @@ TRAINING_STEP = "training_step.json"
 OPTIMIZER_STATE = "optimizer_state.safetensors"
 OPTIMIZER_PARAM_GROUPS = "optimizer_param_groups.json"
 SCHEDULER_STATE = "scheduler_state.json"
-SCALER_STATE = "scaler_state.json"
 
 POLICY_PREPROCESSOR_DEFAULT_NAME = "policy_preprocessor"
 POLICY_POSTPROCESSOR_DEFAULT_NAME = "policy_postprocessor"

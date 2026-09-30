@@ -35,8 +35,11 @@ from lerobot.utils.constants import (
     ACTION,
     DONE,
     INFO,
-    MESSAGES_RENDERED,
     OBS_PREFIX,
+    PI05_METADATA_CONTROL_MODE,
+    PI05_METADATA_MISTAKE,
+    PI05_METADATA_QUALITY,
+    PI05_METADATA_SPEED_STEPS,
     QUERY_KIND,
     QUERY_TEXT,
     REWARD,
@@ -178,13 +181,17 @@ _COMPLEMENTARY_KEYS = (
     "timestamp",
     "language_persistent",
     "language_events",
-    MESSAGES_RENDERED,
+    "messages",
     "message_streams",
     "target_message_indices",
     # Text-generation request keys: carried into complementary_data so a prompt-formatting
     # processor step can read the kind and rewrite QUERY_TEXT.
     QUERY_KIND,
     QUERY_TEXT,
+    PI05_METADATA_SPEED_STEPS,
+    PI05_METADATA_QUALITY,
+    PI05_METADATA_MISTAKE,
+    PI05_METADATA_CONTROL_MODE,
 )
 
 

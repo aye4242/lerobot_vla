@@ -17,8 +17,9 @@
 import builtins
 import logging
 from collections import deque
+from contextlib import contextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, Unpack, cast
+from typing import TYPE_CHECKING, Literal, TypedDict, Unpack
 
 import torch
 import torch.nn.functional as F  # noqa: N812
@@ -61,111 +62,66 @@ from ..common.vla_utils import (
     prepare_attention_masks_4d,
     resize_with_pad_torch,
 )
-from ..pretrained import PreTrainedPolicy, RTCActionSelectKwargs, T
+from ..pretrained import PreTrainedPolicy, T
 from ..rtc.modeling_rtc import RTCProcessor
 from .configuration_pi05 import DEFAULT_IMAGE_SIZE, PI05Config
 from .memory import encode_video_with_mem, sample_observation_history
 
 
-def _prepare_trained_rtc_prefix(
-    x_t: Tensor,
-    prev_chunk_left_over: Tensor | None,
-    inference_delay: int,
-    training_max_delay: int,
-) -> tuple[Tensor | None, Tensor | None]:
-    """Pad and validate a hard prefix for training-time RTC inference."""
-    if prev_chunk_left_over is None or inference_delay <= 0:
-        return None, None
-    if training_max_delay <= 0:
-        raise ValueError(
-            "RTC mode='trained' requires a checkpoint trained with policy.rtc_training_max_delay > 0."
+class ActionSelectKwargs(TypedDict, total=False):
+    inference_delay: int | None
+    prev_chunk_left_over: Tensor | None
+    execution_horizon: int | None
+
+
+@contextmanager
+def _init_empty_parameters():
+    """Initialize parameters on ``meta`` while keeping non-persistent buffers real."""
+
+    old_register_parameter = nn.Module.register_parameter
+
+    def register_meta_parameter(module, name, param):
+        old_register_parameter(module, name, param)
+        if param is None:
+            return
+        registered = module._parameters[name]
+        parameter_type = type(registered)
+        parameter_kwargs = dict(registered.__dict__)
+        requires_grad = parameter_kwargs.pop("requires_grad", param.requires_grad)
+        is_hf_initialized = parameter_kwargs.pop("_is_hf_initialized", None)
+        module._parameters[name] = parameter_type(
+            registered.to(device="meta"),
+            requires_grad=requires_grad,
+            **parameter_kwargs,
         )
-    if inference_delay > training_max_delay:
-        raise ValueError(
-            f"Measured RTC inference delay ({inference_delay}) exceeds the checkpoint's "
-            f"rtc_training_max_delay ({training_max_delay})."
+        if is_hf_initialized is not None:
+            module._parameters[name]._is_hf_initialized = is_hf_initialized
+
+    try:
+        nn.Module.register_parameter = register_meta_parameter
+        yield
+    finally:
+        nn.Module.register_parameter = old_register_parameter
+
+
+def _set_module_tensor(module: nn.Module, key: str, value: Tensor, device: torch.device) -> None:
+    """Materialize one meta parameter or buffer without allocating a second model."""
+
+    module_path, _, tensor_name = key.rpartition(".")
+    owner = module.get_submodule(module_path) if module_path else module
+    if tensor_name in owner._parameters:
+        old_parameter = owner._parameters[tensor_name]
+        if old_parameter is None:
+            raise KeyError(f"Parameter '{key}' is registered as None")
+        owner._parameters[tensor_name] = type(old_parameter)(
+            value.to(device=device, dtype=old_parameter.dtype),
+            requires_grad=old_parameter.requires_grad,
         )
-    if inference_delay >= x_t.shape[1]:
-        raise ValueError(
-            f"RTC inference delay ({inference_delay}) must be smaller than chunk_size ({x_t.shape[1]})."
-        )
-
-    previous = prev_chunk_left_over.to(device=x_t.device, dtype=x_t.dtype)
-    if not torch.isfinite(previous).all():
-        raise ValueError("RTC prefix contains NaN or Inf values.")
-    if previous.ndim == 2:
-        previous = previous.unsqueeze(0)
-    if previous.ndim != 3:
-        raise ValueError(f"Expected RTC prefix shape (B, T, A), got {tuple(previous.shape)}")
-    if previous.shape[0] == 1 and x_t.shape[0] > 1:
-        previous = previous.expand(x_t.shape[0], -1, -1)
-    if previous.shape[0] != x_t.shape[0]:
-        raise ValueError(
-            f"RTC prefix batch size ({previous.shape[0]}) does not match policy batch ({x_t.shape[0]})."
-        )
-    if previous.shape[1] < inference_delay:
-        raise ValueError(f"RTC prefix has {previous.shape[1]} steps, but inference_delay={inference_delay}.")
-    if previous.shape[2] > x_t.shape[2]:
-        raise ValueError(
-            f"RTC prefix action dimension ({previous.shape[2]}) exceeds model dimension ({x_t.shape[2]})."
-        )
-
-    padded_prefix = torch.zeros_like(x_t)
-    padded_prefix[:, :inference_delay, : previous.shape[2]] = previous[:, :inference_delay]
-    prefix_mask = torch.arange(x_t.shape[1], device=x_t.device) < inference_delay
-    prefix_mask = prefix_mask[None, :, None].expand(x_t.shape[0], -1, x_t.shape[2])
-    return padded_prefix, prefix_mask
-
-
-def _sample_training_rtc_prefix_mask(
-    batch_size: int,
-    action_horizon: int,
-    max_delay: int,
-    device: torch.device,
-) -> Tensor | None:
-    """Sample a clean action-prefix length independently for each training example."""
-    if max_delay <= 0:
-        return None
-    delays = torch.randint(0, max_delay + 1, (batch_size,), device=device)
-    positions = torch.arange(action_horizon, device=device)
-    return positions.unsqueeze(0) < delays.unsqueeze(1)
-
-
-def _build_flow_matching_inputs(
-    actions: Tensor,
-    noise: Tensor,
-    time: Tensor,
-    prefix_mask: Tensor | None,
-) -> tuple[Tensor, Tensor]:
-    """Keep the sampled RTC prefix clean while noising the remaining action chunk."""
-    if prefix_mask is None:
-        model_time = time
-        expanded_time = time[:, None, None]
+    elif tensor_name in owner._buffers:
+        old_buffer = owner._buffers[tensor_name]
+        owner._buffers[tensor_name] = value.to(device=device, dtype=old_buffer.dtype)
     else:
-        model_time = time[:, None].expand_as(prefix_mask)
-        model_time = torch.where(prefix_mask, torch.zeros_like(model_time), model_time)
-        expanded_time = model_time.unsqueeze(-1)
-    x_t = expanded_time * noise + (1 - expanded_time) * actions
-    return x_t, model_time
-
-
-def _reduce_training_rtc_loss(
-    losses: Tensor,
-    prefix_mask: Tensor | None,
-    reduction: str,
-) -> Tensor:
-    """Average flow loss over predicted postfix actions, excluding the clean RTC prefix."""
-    if reduction not in {"mean", "none"}:
-        raise ValueError(f"Unsupported loss reduction: {reduction!r}")
-    if prefix_mask is None:
-        return losses.mean() if reduction == "mean" else losses.mean(dim=(1, 2))
-
-    postfix_mask = (~prefix_mask).unsqueeze(-1).expand_as(losses)
-    if reduction == "none":
-        numerator = (losses * postfix_mask).sum(dim=(1, 2))
-        denominator = postfix_mask.sum(dim=(1, 2))
-        return numerator / denominator.clamp(min=1)
-    return (losses * postfix_mask).sum() / postfix_mask.sum().clamp(min=1)
+        raise KeyError(f"'{key}' is not a parameter or buffer")
 
 
 # Define the complete layer computation function for gradient checkpointing
@@ -335,7 +291,6 @@ class PaliGemmaWithExpertModel(
         self.gemma_expert = PiGemmaForCausalLM(config=action_expert_config_hf)
         self.gemma_expert.model.embed_tokens = None
 
-        self.precision = precision
         self.to_bfloat16_for_selected_params(precision)
         self._set_requires_grad()
 
@@ -402,20 +357,11 @@ class PaliGemmaWithExpertModel(
             )
             features = self.paligemma.model.multi_modal_projector(features)
         else:
-            # That float32 pin exists so training never toggles a parameter dtype. Inference has no
-            # optimizer state to protect, so run the matmuls on tensor cores while the stored weights
-            # stay float32. Autocast accumulates in float32, which lands closer to the float32 result
-            # than casting the weights would.
-            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self._vision_autocast(image)):
-                image_outputs = self.paligemma.model.get_image_features(image)
+            image_outputs = self.paligemma.model.get_image_features(image)
             features = image_outputs.pooler_output
         if features.dtype != out_dtype:
             features = features.to(out_dtype)
         return features
-
-    def _vision_autocast(self, image: torch.Tensor) -> bool:
-        """Whether to run the vision tower in bfloat16 for this call."""
-        return not self.training and self.precision == "bfloat16" and image.device.type == "cuda"
 
     def embed_language_tokens(self, tokens: torch.Tensor):
         return self.paligemma.model.language_model.get_input_embeddings()(tokens)
@@ -425,14 +371,12 @@ class PaliGemmaWithExpertModel(
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
         past_key_values: list[torch.FloatTensor] | None = None,
-        inputs_embeds: list[torch.Tensor | None] | None = None,
+        inputs_embeds: list[torch.FloatTensor] | None = None,
         use_cache: bool | None = None,
-        adarms_cond: list[torch.Tensor | None] | None = None,
+        adarms_cond: list[torch.Tensor] | None = None,
     ):
         if adarms_cond is None:
             adarms_cond = [None, None]
-        if inputs_embeds is None:
-            raise ValueError("inputs_embeds must be a [prefix, suffix] pair (either entry may be None)")
         if inputs_embeds[1] is None:
             prefix_output = self.paligemma.model.language_model.forward(
                 inputs_embeds=inputs_embeds[0],
@@ -545,7 +489,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             paligemma_config,
             action_expert_config,
             use_adarms=[False, True],
-            precision=cast(Literal["bfloat16", "float32"], config.dtype),
+            precision=config.dtype,
             image_size=config.image_resolution[0],
             freeze_vision_encoder=config.freeze_vision_encoder,
             train_expert_only=config.train_expert_only,
@@ -570,7 +514,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             torch.set_float32_matmul_precision("high")
             self.sample_actions = torch.compile(self.sample_actions, mode=config.compile_mode)
             # Also compile the main forward pass used during training
-            self.forward = torch.compile(self.forward, mode=config.compile_mode)  # type: ignore[method-assign]
+            self.forward = torch.compile(self.forward, mode=config.compile_mode)
 
     def gradient_checkpointing_enable(self):
         """Enable gradient checkpointing for memory optimization."""
@@ -612,39 +556,6 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             offset=self.config.time_sampling_offset,
         )
 
-    def _embed_one_image(self, img: torch.Tensor, img_mask: torch.Tensor) -> torch.Tensor:
-        """Embed a single camera; ``(B,T,C,H,W)`` inputs take the MEM video path."""
-        if img.ndim == 5:
-            return self.paligemma_with_expert.embed_image(
-                img,
-                frame_mask=img_mask,
-                temporal_attention_every=self.config.memory_temporal_attention_every,
-            )
-        return self.paligemma_with_expert.embed_image(img)
-
-    def _embed_images(self, images: list[torch.Tensor], img_masks: list[torch.Tensor]) -> list[torch.Tensor]:
-        """Embed every camera, as a single batched vision-tower call where that is safe.
-
-        One 224x224 image underfills the GPU, so the tower spends most of a per-camera call on
-        launch and memory latency rather than arithmetic. Training keeps one call per camera:
-        ``_apply_checkpoint`` recomputes each camera separately during the backward pass, and
-        fusing them would multiply peak activation memory by the number of cameras. MEM video
-        inputs (5D) also stay per-camera, since each carries its own frame mask.
-        """
-        batchable = (
-            not self.training
-            and len(images) >= 2
-            and all(img.ndim == 4 for img in images)
-            and len({tuple(img.shape) for img in images}) == 1
-        )
-        if not batchable:
-            return [
-                self._apply_checkpoint(self._embed_one_image, img, img_mask)
-                for img, img_mask in zip(images, img_masks, strict=True)
-            ]
-        batched = self.paligemma_with_expert.embed_image(torch.cat(images, dim=0))
-        return list(torch.chunk(batched, len(images), dim=0))
-
     def embed_prefix(
         self, images, img_masks, tokens, masks, states=None, state_masks=None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -654,7 +565,18 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         att_masks = []
 
         # Process images
-        for img_emb, img_mask in zip(self._embed_images(images, img_masks), img_masks, strict=True):
+        for img, img_mask in zip(images, img_masks, strict=True):
+
+            def image_embed_func(img, img_mask):
+                if img.ndim == 5:
+                    return self.paligemma_with_expert.embed_image(
+                        img,
+                        frame_mask=img_mask,
+                        temporal_attention_every=self.config.memory_temporal_attention_every,
+                    )
+                return self.paligemma_with_expert.embed_image(img)
+
+            img_emb = self._apply_checkpoint(image_embed_func, img, img_mask)
             bsize, num_img_embs = img_emb.shape[:2]
 
             embs.append(img_emb)
@@ -740,18 +662,18 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         actions,
         noise,
         time,
-        prefix_mask: Tensor | None = None,
         states=None,
         state_masks=None,
     ) -> Tensor:
         """Do a full training forward pass and compute the loss."""
-        x_t, model_time = _build_flow_matching_inputs(actions, noise, time, prefix_mask)
+        time_expanded = time[:, None, None]
+        x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             images, img_masks, tokens, masks, states, state_masks
         )
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, model_time)
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, time)
 
         if (
             self.paligemma_with_expert.paligemma.model.language_model.layers[0].self_attn.q_proj.weight.dtype
@@ -804,7 +726,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         state_masks=None,
         noise=None,
         num_steps=None,
-        **kwargs: Unpack[RTCActionSelectKwargs],
+        **kwargs: Unpack[ActionSelectKwargs],
     ) -> Tensor:
         """Do a full inference forward and compute the action."""
         if num_steps is None:
@@ -839,28 +761,6 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             use_cache=True,
         )
 
-        rtc_mode = "guided"
-        trained_prefix = trained_prefix_mask = None
-        if self._rtc_enabled():
-            if self.rtc_processor is None:
-                raise ValueError(
-                    "RTC is enabled in the config but PI05Pytorch was built without an RTCProcessor"
-                )
-            rtc_mode = self.rtc_processor.rtc_config.mode
-            if rtc_mode == "trained":
-                training_max_delay = int(getattr(self.config, "rtc_training_max_delay", 0))
-                if training_max_delay <= 0:
-                    raise ValueError(
-                        "RTC mode='trained' requires a checkpoint trained with "
-                        "policy.rtc_training_max_delay > 0."
-                    )
-                trained_prefix, trained_prefix_mask = _prepare_trained_rtc_prefix(
-                    noise,
-                    kwargs.get("prev_chunk_left_over"),
-                    int(kwargs.get("inference_delay") or 0),
-                    training_max_delay,
-                )
-
         return euler_integrate(
             lambda input_x_t, current_timestep: self.denoise_step(
                 prefix_pad_masks=prefix_pad_masks,
@@ -871,12 +771,10 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             noise,
             num_steps,
             rtc_processor=self.rtc_processor,
-            rtc_enabled=self._rtc_enabled() and rtc_mode == "guided",
+            rtc_enabled=self._rtc_enabled(),
             inference_delay=kwargs.get("inference_delay"),
             prev_chunk_left_over=kwargs.get("prev_chunk_left_over"),
             execution_horizon=kwargs.get("execution_horizon"),
-            hard_prefix=trained_prefix,
-            hard_prefix_mask=trained_prefix_mask,
         )
 
     def denoise_step(
@@ -950,7 +848,11 @@ class PI05Policy(PreTrainedPolicy):
         if config.gradient_checkpointing:
             self.model.gradient_checkpointing_enable()
 
-        self.model.to(config.device)
+        # The low-memory loader constructs parameters on meta and materializes
+        # them directly from safetensors. Moving a meta model here would also
+        # discard initialized non-persistent buffers.
+        if torch.device(config.device).type != "meta":
+            self.model.to(config.device)
 
         self.reset()
 
@@ -968,6 +870,7 @@ class PI05Policy(PreTrainedPolicy):
         local_files_only: bool = False,
         revision: str | None = None,
         strict: bool = True,
+        low_cpu_mem_usage: bool | None = None,
         **kwargs,
     ) -> T:
         """Override the from_pretrained method to handle key remapping and display important disclaimer."""
@@ -990,6 +893,25 @@ class PI05Policy(PreTrainedPolicy):
                 cache_dir=cache_dir,
                 local_files_only=local_files_only,
                 revision=revision,
+                **kwargs,
+            )
+
+        target_device = torch.device(config.device)
+        if low_cpu_mem_usage is None:
+            low_cpu_mem_usage = target_device.type == "cuda"
+        if low_cpu_mem_usage:
+            return cls._from_pretrained_low_cpu_mem(
+                pretrained_name_or_path=pretrained_name_or_path,
+                config=config,
+                target_device=target_device,
+                force_download=force_download,
+                resume_download=resume_download,
+                proxies=proxies,
+                token=token,
+                cache_dir=cache_dir,
+                local_files_only=local_files_only,
+                revision=revision,
+                strict=strict,
                 **kwargs,
             )
 
@@ -1086,6 +1008,119 @@ class PI05Policy(PreTrainedPolicy):
             ):
                 state_dict.setdefault(key, current[key])
         return state_dict
+
+    @classmethod
+    def _from_pretrained_low_cpu_mem(
+        cls: builtins.type[T],
+        pretrained_name_or_path: str | Path,
+        *,
+        config: PreTrainedConfig,
+        target_device: torch.device,
+        force_download: bool,
+        resume_download: bool | None,
+        proxies: dict | None,
+        token: str | bool | None,
+        cache_dir: str | Path | None,
+        local_files_only: bool,
+        revision: str | None,
+        strict: bool,
+        **kwargs,
+    ) -> T:
+        """Stream a safetensors checkpoint into a meta-initialized Pi0.5 model."""
+
+        from safetensors import safe_open
+        from transformers.utils import cached_file
+
+        resolved_file = cached_file(
+            pretrained_name_or_path,
+            "model.safetensors",
+            cache_dir=cache_dir,
+            force_download=force_download,
+            resume_download=resume_download,
+            proxies=proxies,
+            token=token,
+            revision=revision,
+            local_files_only=local_files_only,
+        )
+        if resolved_file is None:
+            raise FileNotFoundError(f"model.safetensors was not found in {pretrained_name_or_path}")
+
+        original_device = config.device
+        config.device = "meta"
+        try:
+            with _init_empty_parameters():
+                model = cls(config, **kwargs)
+        finally:
+            config.device = original_device
+        model.config.device = str(target_device)
+
+        expected_state = model.state_dict()
+        expected_keys = set(expected_state)
+        loaded_keys: set[str] = set()
+        unexpected_keys: set[str] = set()
+
+        print(f"Streaming Pi0.5 weights to {target_device} from: {resolved_file}", flush=True)
+        with safe_open(resolved_file, framework="pt", device="cpu") as checkpoint:
+            checkpoint_keys = list(checkpoint.keys())
+            for index, checkpoint_key in enumerate(checkpoint_keys, start=1):
+                checkpoint_value = checkpoint.get_tensor(checkpoint_key)
+                fixed_values = model._fix_pytorch_state_dict_keys(
+                    {checkpoint_key: checkpoint_value}, model.config
+                )
+                for fixed_key, fixed_value in fixed_values.items():
+                    target_key = fixed_key if fixed_key.startswith("model.") else f"model.{fixed_key}"
+                    if target_key not in expected_keys:
+                        unexpected_keys.add(target_key)
+                        continue
+                    if expected_state[target_key].shape != fixed_value.shape:
+                        raise RuntimeError(
+                            f"Shape mismatch for {target_key}: expected {tuple(expected_state[target_key].shape)}, "
+                            f"got {tuple(fixed_value.shape)}"
+                        )
+                    _set_module_tensor(model, target_key, fixed_value, target_device)
+                    loaded_keys.add(target_key)
+                del fixed_values, checkpoint_value
+                if index % 100 == 0 or index == len(checkpoint_keys):
+                    print(f"Loaded {index}/{len(checkpoint_keys)} checkpoint tensors", flush=True)
+
+        for buffer_name, buffer in list(model.named_buffers()):
+            if buffer.device != target_device:
+                _set_module_tensor(model, buffer_name, buffer, target_device)
+
+        # MEM adds this projection after the original checkpoint was trained. When
+        # streaming an older checkpoint, initialize only the missing projection keys.
+        if getattr(model.config, "use_proprioceptive_memory", False):
+            projection = model.model.proprio_history_proj
+            fresh_projection = nn.Linear(
+                projection.in_features,
+                projection.out_features,
+                device=target_device,
+                dtype=projection.weight.dtype,
+            )
+            for key, value in fresh_projection.state_dict().items():
+                target_key = f"model.proprio_history_proj.{key}"
+                if target_key not in loaded_keys:
+                    _set_module_tensor(model, target_key, value, target_device)
+                    loaded_keys.add(target_key)
+
+        missing_keys = expected_keys - loaded_keys
+        if strict and (missing_keys or unexpected_keys):
+            raise RuntimeError(
+                "Error(s) loading Pi0.5 state_dict: "
+                f"missing={sorted(missing_keys)}, unexpected={sorted(unexpected_keys)}"
+            )
+        if missing_keys:
+            logging.warning("Missing Pi0.5 checkpoint keys: %s", sorted(missing_keys))
+        if unexpected_keys:
+            logging.warning("Unexpected Pi0.5 checkpoint keys: %s", sorted(unexpected_keys))
+
+        meta_parameters = [name for name, parameter in model.named_parameters() if parameter.is_meta]
+        if meta_parameters:
+            raise RuntimeError(f"Pi0.5 parameters remain on meta after loading: {meta_parameters}")
+
+        print("All Pi0.5 keys loaded successfully with low CPU memory usage!", flush=True)
+        model.reset()
+        return model
 
     def _fix_pytorch_state_dict_keys(
         self, state_dict, model_config
@@ -1186,10 +1221,7 @@ class PI05Policy(PreTrainedPolicy):
         # Create processor if config provided
         # If RTC is not enabled - we can still track the denoising data
         if self.config.rtc_config is not None:
-            self.rtc_processor = RTCProcessor(
-                self.config.rtc_config,
-                trained_mode_supported=int(getattr(self.config, "rtc_training_max_delay", 0)) > 0,
-            )
+            self.rtc_processor = RTCProcessor(self.config.rtc_config)
 
             model_value = getattr(self, "model", None)
             if model_value is not None:
@@ -1347,9 +1379,7 @@ class PI05Policy(PreTrainedPolicy):
         return self._action_queue.popleft()
 
     @torch.no_grad()
-    def predict_action_chunk(
-        self, batch: dict[str, Tensor], **kwargs: Unpack[RTCActionSelectKwargs]
-    ) -> Tensor:
+    def predict_action_chunk(self, batch: dict[str, Tensor], **kwargs: Unpack[ActionSelectKwargs]) -> Tensor:
         """Predict a chunk of actions given environment observations."""
         self.eval()
 
@@ -1374,8 +1404,6 @@ class PI05Policy(PreTrainedPolicy):
         )
 
         # Unpad actions to actual action dimension
-        if self.config.output_features is None:
-            raise ValueError("output_features must be set (validate_features) before predicting actions")
         original_action_dim = self.config.output_features[ACTION].shape[0]
         actions = actions[:, :, :original_action_dim]
 
@@ -1399,12 +1427,6 @@ class PI05Policy(PreTrainedPolicy):
 
         noise = self.model.sample_noise(actions.shape, actions.device)
         time = self.model.sample_time(actions.shape[0], actions.device)
-        prefix_mask = _sample_training_rtc_prefix_mask(
-            actions.shape[0],
-            actions.shape[1],
-            self.config.rtc_training_max_delay,
-            actions.device,
-        )
 
         # Compute loss (no separate state needed for PI05)
         losses = self.model.forward(
@@ -1415,34 +1437,30 @@ class PI05Policy(PreTrainedPolicy):
             actions,
             noise,
             time,
-            prefix_mask=prefix_mask,
             states=states,
             state_masks=state_masks,
         )
 
         # Truncate losses to actual action dimensions
-        if self.config.output_features is None:
-            raise ValueError("output_features must be set (validate_features) before computing the loss")
         original_action_dim = self.config.output_features[ACTION].shape[0]
         losses = losses[:, :, :original_action_dim]
 
-        if prefix_mask is None:
-            loss_per_dim = losses.mean(dim=(0, 1))
-        else:
-            postfix_mask = (~prefix_mask).unsqueeze(-1).expand_as(losses)
-            loss_per_dim = (losses * postfix_mask).sum(dim=(0, 1)) / postfix_mask.sum(dim=(0, 1)).clamp(min=1)
-        loss_dict = {"loss_per_dim": loss_per_dim.detach().cpu().numpy().tolist()}
+        loss_dict = {
+            "loss_per_dim": losses.mean(dim=[0, 1]).detach().cpu().numpy().tolist(),
+        }
 
         if reduction == "none":
-            per_sample_loss = _reduce_training_rtc_loss(losses, prefix_mask, reduction="none")
+            # Return per-sample losses (B,) by averaging over time and action dims
+            per_sample_loss = losses.mean(dim=(1, 2))
             loss_dict["loss"] = per_sample_loss.mean().item()
             return per_sample_loss, loss_dict
+        else:
+            # Default: return scalar mean loss
+            loss = losses.mean()
+            loss_dict["loss"] = loss.item()
+            return loss, loss_dict
 
-        loss = _reduce_training_rtc_loss(losses, prefix_mask, reduction="mean")
-        loss_dict["loss"] = loss.item()
-        return loss, loss_dict
-
-    def _get_default_peft_targets(self) -> dict[str, Any]:
+    def _get_default_peft_targets(self) -> dict[str, any]:
         """Return default PEFT target modules for PI0.5 fine-tuning."""
         common_projections = "state_proj|action_in_proj|action_out_proj|time_mlp_in|time_mlp_out"
         target_modules = rf"(.*\.gemma_expert\..*\.self_attn\.(q|v)_proj|model\.({common_projections}))"

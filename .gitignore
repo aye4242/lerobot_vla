@@ -166,6 +166,29 @@ wandb/
 data/
 outputs/
 
+# Training outputs and checkpoints
+checkpoints/
+*.safetensors
+*.ckpt
+*.pth
+*.pt
+
+# Large documentation files
+*.pdf
+
+# Large architecture diagrams (keep small ones in docs/)
+groot-n1-7-architecture.png
+pi05_new_task_objects_annotated.png
+# Keep small architecture diagrams if needed
+# !docs/**/*.pdf
+
+# Spec workflow (if auto-generated)
+.spec-workflow/
+.zcf/
+
+# MuJoCo logs
+MUJOCO_LOG.TXT
+
 # Translations
 *.mo
 *.pot

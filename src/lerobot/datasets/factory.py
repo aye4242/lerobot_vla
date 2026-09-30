@@ -29,6 +29,7 @@ from lerobot.utils.constants import ACTION, IMAGENET_STATS, OBS_IMAGE, OBS_PREFI
 from .dataset_metadata import LeRobotDatasetMetadata
 from .lerobot_dataset import LeRobotDataset
 from .multi_dataset import MultiLeRobotDataset
+from .pi05_metadata import PI05EpisodeMetadataDataset
 from .storage import DEFAULT_STORAGE_FORMAT, load_dataset_metadata
 from .streaming_dataset import StreamingLeRobotDataset
 from .utils import resolve_episode_indices
@@ -281,4 +282,16 @@ def make_train_eval_datasets(
                 for stats_type, stats in IMAGENET_STATS.items():
                     ds.meta.stats[key][stats_type] = torch.tensor(stats, dtype=torch.float32)
 
+    metadata_path = getattr(cfg.trainable_config, "episode_metadata_path", None)
+    if getattr(cfg.trainable_config, "use_episode_metadata", False) and metadata_path is not None:
+        if cfg.dataset.streaming:
+            raise ValueError("PI05 episode metadata currently requires a map-style dataset")
+        missing_policy = getattr(cfg.trainable_config, "metadata_missing_policy", "error")
+        train_dataset = PI05EpisodeMetadataDataset(
+            train_dataset, metadata_path, missing_policy=missing_policy
+        )
+        if eval_dataset is not None:
+            eval_dataset = PI05EpisodeMetadataDataset(
+                eval_dataset, metadata_path, missing_policy=missing_policy
+            )
     return train_dataset, eval_dataset

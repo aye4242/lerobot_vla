@@ -71,6 +71,19 @@ def get_intermediate_size(hidden_dim, ffn_dim_multiplier=4, multiple_of=256):
     return hidden_dim
 
 
+def _requires_fp32_attention_value_matmul(value_states: torch.Tensor) -> bool:
+    """Return whether BF16 attention value aggregation needs an FP32 fallback.
+
+    CUDA devices before Ampere cannot execute BF16 strided batched GEMM, which
+    is the operation used by eager attention to aggregate value states.
+    """
+    if value_states.device.type != "cuda" or value_states.dtype != torch.bfloat16:
+        return False
+
+    major, _ = torch.cuda.get_device_capability(value_states.device)
+    return major < 8
+
+
 class SmolVLMWithExpertModel(nn.Module):
     def __init__(
         self,
@@ -561,7 +574,11 @@ class SmolVLMWithExpertModel(nn.Module):
         probs = nn.functional.softmax(masked_att_weights, dim=-1)
         probs = probs.to(dtype=value_states.dtype)
 
-        att_output = torch.matmul(probs, value_states.permute(0, 2, 1, 3))
+        value_states = value_states.permute(0, 2, 1, 3)
+        if _requires_fp32_attention_value_matmul(value_states):
+            att_output = torch.matmul(probs.float(), value_states.float()).to(dtype=value_states.dtype)
+        else:
+            att_output = torch.matmul(probs, value_states)
 
         att_output = att_output.permute(0, 2, 1, 3)
         # we use -1 because sequence length can change

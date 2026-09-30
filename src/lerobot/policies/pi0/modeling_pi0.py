@@ -17,8 +17,9 @@
 import builtins
 import logging
 from collections import deque
+from contextlib import contextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, Unpack, cast
+from typing import TYPE_CHECKING, Literal, TypedDict, Unpack
 
 import torch
 import torch.nn.functional as F  # noqa: N812
@@ -63,9 +64,73 @@ from ..common.vla_utils import (
     prepare_attention_masks_4d,
     resize_with_pad_torch,
 )
-from ..pretrained import PreTrainedPolicy, RTCActionSelectKwargs, T
+from ..pretrained import PreTrainedPolicy, T
 from ..rtc.modeling_rtc import RTCProcessor
 from .configuration_pi0 import DEFAULT_IMAGE_SIZE, PI0Config
+
+
+class ActionSelectKwargs(TypedDict, total=False):
+    inference_delay: int | None
+    prev_chunk_left_over: Tensor | None
+    execution_horizon: int | None
+
+
+@contextmanager
+def _init_empty_parameters():
+    """Initialize module parameters on ``meta`` while keeping small buffers real.
+
+    Pi0 has roughly 14 GB of FP32 checkpoint tensors. Constructing a complete
+    random CPU model before reading the checkpoint temporarily needs about twice
+    that amount of host memory. This context mirrors the parameter-only behavior
+    of ``accelerate.init_empty_weights`` without adding Accelerate as a Pi0 runtime
+    dependency. Buffers remain on CPU so non-persistent RoPE/SigLIP constants keep
+    their initialized values.
+    """
+
+    old_register_parameter = nn.Module.register_parameter
+
+    def register_meta_parameter(module, name, param):
+        old_register_parameter(module, name, param)
+        if param is None:
+            return
+        registered = module._parameters[name]
+        parameter_type = type(registered)
+        parameter_kwargs = dict(registered.__dict__)
+        requires_grad = parameter_kwargs.pop("requires_grad", param.requires_grad)
+        is_hf_initialized = parameter_kwargs.pop("_is_hf_initialized", None)
+        module._parameters[name] = parameter_type(
+            registered.to(device="meta"),
+            requires_grad=requires_grad,
+            **parameter_kwargs,
+        )
+        if is_hf_initialized is not None:
+            module._parameters[name]._is_hf_initialized = is_hf_initialized
+
+    try:
+        nn.Module.register_parameter = register_meta_parameter
+        yield
+    finally:
+        nn.Module.register_parameter = old_register_parameter
+
+
+def _set_module_tensor(module: nn.Module, key: str, value: Tensor, device: torch.device) -> None:
+    """Materialize one meta parameter or buffer without allocating a second model."""
+
+    module_path, _, tensor_name = key.rpartition(".")
+    owner = module.get_submodule(module_path) if module_path else module
+    if tensor_name in owner._parameters:
+        old_parameter = owner._parameters[tensor_name]
+        if old_parameter is None:
+            raise KeyError(f"Parameter '{key}' is registered as None")
+        owner._parameters[tensor_name] = type(old_parameter)(
+            value.to(device=device, dtype=old_parameter.dtype),
+            requires_grad=old_parameter.requires_grad,
+        )
+    elif tensor_name in owner._buffers:
+        old_buffer = owner._buffers[tensor_name]
+        owner._buffers[tensor_name] = value.to(device=device, dtype=old_buffer.dtype)
+    else:
+        raise KeyError(f"'{key}' is not a parameter or buffer")
 
 
 # Define the complete layer computation function for gradient checkpointing
@@ -235,7 +300,6 @@ class PaliGemmaWithExpertModel(
         self.gemma_expert = PiGemmaForCausalLM(config=action_expert_config_hf)
         self.gemma_expert.model.embed_tokens = None
 
-        self.precision = precision
         self.to_bfloat16_for_selected_params(precision)
         self._set_requires_grad()
 
@@ -284,20 +348,11 @@ class PaliGemmaWithExpertModel(
         out_dtype = image.dtype
         if image.dtype != torch.float32:
             image = image.to(torch.float32)
-        # That float32 pin exists so training never toggles a parameter dtype. Inference has no
-        # optimizer state to protect, so run the matmuls on tensor cores while the stored weights
-        # stay float32. Autocast accumulates in float32, which lands closer to the float32 result
-        # than casting the weights would.
-        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self._vision_autocast(image)):
-            image_outputs = self.paligemma.model.get_image_features(image)
+        image_outputs = self.paligemma.model.get_image_features(image)
         features = image_outputs.pooler_output
         if features.dtype != out_dtype:
             features = features.to(out_dtype)
         return features
-
-    def _vision_autocast(self, image: torch.Tensor) -> bool:
-        """Whether to run the vision tower in bfloat16 for this call."""
-        return not self.training and self.precision == "bfloat16" and image.device.type == "cuda"
 
     def embed_language_tokens(self, tokens: torch.Tensor):
         return self.paligemma.model.language_model.get_input_embeddings()(tokens)
@@ -307,14 +362,12 @@ class PaliGemmaWithExpertModel(
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
         past_key_values: list[torch.FloatTensor] | None = None,
-        inputs_embeds: list[torch.Tensor | None] | None = None,
+        inputs_embeds: list[torch.FloatTensor] | None = None,
         use_cache: bool | None = None,
-        adarms_cond: list[torch.Tensor | None] | None = None,
+        adarms_cond: list[torch.Tensor] | None = None,
     ):
         if adarms_cond is None:
             adarms_cond = [None, None]
-        if inputs_embeds is None:
-            raise ValueError("inputs_embeds must be a [prefix, suffix] pair (either entry may be None)")
         if inputs_embeds[1] is None:
             prefix_output = self.paligemma.model.language_model.forward(
                 inputs_embeds=inputs_embeds[0],
@@ -427,7 +480,7 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             paligemma_config,
             action_expert_config,
             use_adarms=[False, False],
-            precision=cast(Literal["bfloat16", "float32"], config.dtype),
+            precision=config.dtype,
             image_size=config.image_resolution[0],
             freeze_vision_encoder=config.freeze_vision_encoder,
             train_expert_only=config.train_expert_only,
@@ -448,7 +501,7 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             torch.set_float32_matmul_precision("high")
             self.sample_actions = torch.compile(self.sample_actions, mode=config.compile_mode)
             # Also compile the main forward pass used during training
-            self.forward = torch.compile(self.forward, mode=config.compile_mode)  # type: ignore[method-assign]
+            self.forward = torch.compile(self.forward, mode=config.compile_mode)
 
     def gradient_checkpointing_enable(self):
         """Enable gradient checkpointing for memory optimization."""
@@ -490,20 +543,6 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             offset=self.config.time_sampling_offset,
         )
 
-    def _embed_images(self, images: list[torch.Tensor]) -> list[torch.Tensor]:
-        """Embed every camera, as a single batched vision-tower call where that is safe.
-
-        One 224x224 image underfills the GPU, so the tower spends most of a per-camera call on
-        launch and memory latency rather than arithmetic. Training keeps one call per camera:
-        ``_apply_checkpoint`` recomputes each camera separately during the backward pass, and
-        fusing them would multiply peak activation memory by the number of cameras.
-        """
-        batchable = not self.training and len(images) >= 2 and len({tuple(img.shape) for img in images}) == 1
-        if not batchable:
-            return [self._apply_checkpoint(self.paligemma_with_expert.embed_image, img) for img in images]
-        batched = self.paligemma_with_expert.embed_image(torch.cat(images, dim=0))
-        return list(torch.chunk(batched, len(images), dim=0))
-
     def embed_prefix(
         self, images, img_masks, lang_tokens, lang_masks
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -513,7 +552,12 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         att_masks = []
 
         # Process images
-        for img_emb, img_mask in zip(self._embed_images(images), img_masks, strict=True):
+        for img, img_mask in zip(images, img_masks, strict=True):
+
+            def image_embed_func(img):
+                return self.paligemma_with_expert.embed_image(img)
+
+            img_emb = self._apply_checkpoint(image_embed_func, img)
             bsize, num_img_embs = img_emb.shape[:2]
 
             embs.append(img_emb)
@@ -665,7 +709,7 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         state,
         noise=None,
         num_steps=None,
-        **kwargs: Unpack[RTCActionSelectKwargs],
+        **kwargs: Unpack[ActionSelectKwargs],
     ) -> Tensor:
         """Do a full inference forward and compute the action."""
         if num_steps is None:
@@ -789,7 +833,11 @@ class PI0Policy(PreTrainedPolicy):
         if config.gradient_checkpointing:
             self.model.gradient_checkpointing_enable()
 
-        self.model.to(config.device)
+        # ``from_pretrained`` can construct parameters on the meta device and
+        # materialize them directly from safetensors. Calling ``to(meta)`` here
+        # would also discard the initialized non-persistent buffers.
+        if torch.device(config.device).type != "meta":
+            self.model.to(config.device)
 
         self.reset()
 
@@ -807,6 +855,7 @@ class PI0Policy(PreTrainedPolicy):
         local_files_only: bool = False,
         revision: str | None = None,
         strict: bool = True,
+        low_cpu_mem_usage: bool | None = None,
         **kwargs,
     ) -> T:
         """Override the from_pretrained method to handle key remapping and display important disclaimer."""
@@ -829,6 +878,25 @@ class PI0Policy(PreTrainedPolicy):
                 cache_dir=cache_dir,
                 local_files_only=local_files_only,
                 revision=revision,
+                **kwargs,
+            )
+
+        target_device = torch.device(config.device)
+        if low_cpu_mem_usage is None:
+            low_cpu_mem_usage = target_device.type == "cuda"
+        if low_cpu_mem_usage:
+            return cls._from_pretrained_low_cpu_mem(
+                pretrained_name_or_path=pretrained_name_or_path,
+                config=config,
+                target_device=target_device,
+                force_download=force_download,
+                resume_download=resume_download,
+                proxies=proxies,
+                token=token,
+                cache_dir=cache_dir,
+                local_files_only=local_files_only,
+                revision=revision,
+                strict=strict,
                 **kwargs,
             )
 
@@ -909,6 +977,105 @@ class PI0Policy(PreTrainedPolicy):
         except Exception as e:
             print(f"Warning: Could not load state dict: {e}")
 
+        return model
+
+    @classmethod
+    def _from_pretrained_low_cpu_mem(
+        cls: builtins.type[T],
+        pretrained_name_or_path: str | Path,
+        *,
+        config: PreTrainedConfig,
+        target_device: torch.device,
+        force_download: bool,
+        resume_download: bool | None,
+        proxies: dict | None,
+        token: str | bool | None,
+        cache_dir: str | Path | None,
+        local_files_only: bool,
+        revision: str | None,
+        strict: bool,
+        **kwargs,
+    ) -> T:
+        """Stream a safetensors checkpoint into a meta-initialized Pi0 model."""
+
+        from safetensors import safe_open
+        from transformers.utils import cached_file
+
+        resolved_file = cached_file(
+            pretrained_name_or_path,
+            "model.safetensors",
+            cache_dir=cache_dir,
+            force_download=force_download,
+            resume_download=resume_download,
+            proxies=proxies,
+            token=token,
+            revision=revision,
+            local_files_only=local_files_only,
+        )
+        if resolved_file is None:
+            raise FileNotFoundError(f"model.safetensors was not found in {pretrained_name_or_path}")
+
+        original_device = config.device
+        config.device = "meta"
+        try:
+            with _init_empty_parameters():
+                model = cls(config, **kwargs)
+        finally:
+            config.device = original_device
+        model.config.device = str(target_device)
+
+        expected_state = model.state_dict()
+        expected_keys = set(expected_state)
+        loaded_keys: set[str] = set()
+        unexpected_keys: set[str] = set()
+
+        print(f"Streaming Pi0 weights to {target_device} from: {resolved_file}", flush=True)
+        with safe_open(resolved_file, framework="pt", device="cpu") as checkpoint:
+            checkpoint_keys = list(checkpoint.keys())
+            for index, checkpoint_key in enumerate(checkpoint_keys, start=1):
+                checkpoint_value = checkpoint.get_tensor(checkpoint_key)
+                fixed_values = model._fix_pytorch_state_dict_keys(
+                    {checkpoint_key: checkpoint_value}, model.config
+                )
+                for fixed_key, fixed_value in fixed_values.items():
+                    target_key = fixed_key if fixed_key.startswith("model.") else f"model.{fixed_key}"
+                    if target_key not in expected_keys:
+                        unexpected_keys.add(target_key)
+                        continue
+                    if expected_state[target_key].shape != fixed_value.shape:
+                        raise RuntimeError(
+                            f"Shape mismatch for {target_key}: expected {tuple(expected_state[target_key].shape)}, "
+                            f"got {tuple(fixed_value.shape)}"
+                        )
+                    _set_module_tensor(model, target_key, fixed_value, target_device)
+                    loaded_keys.add(target_key)
+                del fixed_values, checkpoint_value
+                if index % 100 == 0 or index == len(checkpoint_keys):
+                    print(f"Loaded {index}/{len(checkpoint_keys)} checkpoint tensors", flush=True)
+
+        # Non-persistent RoPE/SigLIP buffers are deliberately initialized on CPU
+        # while parameters are meta, then moved after all weights are materialized.
+        for buffer_name, buffer in list(model.named_buffers()):
+            if buffer.device != target_device:
+                _set_module_tensor(model, buffer_name, buffer, target_device)
+
+        missing_keys = expected_keys - loaded_keys
+        if strict and (missing_keys or unexpected_keys):
+            raise RuntimeError(
+                "Error(s) loading Pi0 state_dict: "
+                f"missing={sorted(missing_keys)}, unexpected={sorted(unexpected_keys)}"
+            )
+        if missing_keys:
+            logging.warning("Missing Pi0 checkpoint keys: %s", sorted(missing_keys))
+        if unexpected_keys:
+            logging.warning("Unexpected Pi0 checkpoint keys: %s", sorted(unexpected_keys))
+
+        meta_parameters = [name for name, parameter in model.named_parameters() if parameter.is_meta]
+        if meta_parameters:
+            raise RuntimeError(f"Pi0 parameters remain on meta after loading: {meta_parameters}")
+
+        print("All Pi0 keys loaded successfully with low CPU memory usage!", flush=True)
+        model.reset()
         return model
 
     def _fix_pytorch_state_dict_keys(
@@ -1088,9 +1255,7 @@ class PI0Policy(PreTrainedPolicy):
         return self._action_queue.popleft()
 
     @torch.no_grad()
-    def predict_action_chunk(
-        self, batch: dict[str, Tensor], **kwargs: Unpack[RTCActionSelectKwargs]
-    ) -> Tensor:
+    def predict_action_chunk(self, batch: dict[str, Tensor], **kwargs: Unpack[ActionSelectKwargs]) -> Tensor:
         """Predict a chunk of actions given environment observations."""
         self.eval()
 
@@ -1103,8 +1268,6 @@ class PI0Policy(PreTrainedPolicy):
         actions = self.model.sample_actions(images, img_masks, lang_tokens, lang_masks, state, **kwargs)
 
         # Unpad actions to actual action dimension
-        if self.config.output_features is None:
-            raise ValueError("output_features must be set (validate_features) before predicting actions")
         original_action_dim = self.config.output_features[ACTION].shape[0]
         actions = actions[:, :, :original_action_dim]
 
@@ -1132,8 +1295,6 @@ class PI0Policy(PreTrainedPolicy):
         losses = self.model.forward(images, img_masks, lang_tokens, lang_masks, state, actions, noise, time)
 
         # Truncate losses to actual action dimensions
-        if self.config.output_features is None:
-            raise ValueError("output_features must be set (validate_features) before computing the loss")
         original_action_dim = self.config.output_features[ACTION].shape[0]
         losses = losses[:, :, :original_action_dim]
 
@@ -1152,7 +1313,7 @@ class PI0Policy(PreTrainedPolicy):
             loss_dict["loss"] = loss.item()
             return loss, loss_dict
 
-    def _get_default_peft_targets(self) -> dict[str, Any]:
+    def _get_default_peft_targets(self) -> dict[str, any]:
         """Return default PEFT target modules for PI0 fine-tuning."""
         common_projections = (
             "state_proj|action_in_proj|action_out_proj|action_time_mlp_in|action_time_mlp_out"

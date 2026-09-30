@@ -590,6 +590,14 @@ def train(cfg: TrainPipelineConfig) -> None:
             },
             "rename_observations_processor": {"rename_map": cfg.rename_map},
         }
+        if cfg.tokenizer_path is not None:
+            tokenizer_path = cfg.tokenizer_path.expanduser().resolve()
+            if not tokenizer_path.is_dir():
+                raise FileNotFoundError(f"Tokenizer directory not found: {tokenizer_path}")
+            preprocessor_overrides["tokenizer_processor"] = {
+                "tokenizer_name": str(tokenizer_path)
+            }
+            logging.info("Using local tokenizer override: %s", tokenizer_path)
         postprocessor_overrides = {
             "unnormalizer_processor": {
                 "features": policy.config.output_features,

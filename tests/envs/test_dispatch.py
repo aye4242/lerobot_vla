@@ -41,6 +41,13 @@ def test_libero_fps_controls_simulator_frequency():
     assert cfg.gym_kwargs["control_freq"] == 17
 
 
+def test_libero_auto_reset_can_be_disabled_for_interactive_viewers():
+    cfg = LiberoEnv(auto_reset_on_termination=False, terminate_on_success=False)
+
+    assert cfg.gym_kwargs["auto_reset_on_termination"] is False
+    assert cfg.gym_kwargs["terminate_on_success"] is False
+
+
 def test_libero_rejects_nonpositive_fps():
     with pytest.raises(ValueError, match="fps must be positive"):
         LiberoEnv(fps=0)

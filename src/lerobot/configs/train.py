@@ -116,6 +116,9 @@ class TrainPipelineConfig(HubMixin):
     # with the same value for `dir` its contents will be overwritten unless you set `resume` to true.
     output_dir: Path | None = None
     job_name: str | None = None
+    # Optional local tokenizer assets for offline VLA training. This mirrors
+    # EvalPipelineConfig.tokenizer_path and overrides the processor checkpoint.
+    tokenizer_path: Path | None = None
     # Set `resume` to true to resume a previous run. Pass `--config_path` pointing at either a local
     # checkpoint's train_config.json or a Hub repo id holding `checkpoints/<step>/` subtrees (the
     # latest checkpoint is downloaded and resumed from). Note that when resuming, the default behavior

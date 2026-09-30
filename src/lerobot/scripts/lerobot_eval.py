@@ -52,6 +52,7 @@ You can learn about the CLI options for this script in the `EvalPipelineConfig` 
 import concurrent.futures as cf
 import json
 import logging
+import os
 import threading
 import time
 from collections import defaultdict
@@ -72,7 +73,7 @@ from termcolor import colored
 from torch import Tensor, nn
 from tqdm import trange
 
-from lerobot.configs import FeatureType, PolicyFeature, parser
+from lerobot.configs import FeatureType, parser
 from lerobot.configs.eval import EvalPipelineConfig
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.envs import (
@@ -85,10 +86,9 @@ from lerobot.envs import (
 from lerobot.envs.utils import NEW_ROLLOUT_OPTION
 from lerobot.lerobot_types import PolicyAction
 from lerobot.policies import PreTrainedPolicy, make_policy, make_pre_post_processors
-from lerobot.processor import PolicyProcessorPipeline, bind_relative_anchor
+from lerobot.processor import PolicyProcessorPipeline
 from lerobot.utils.constants import ACTION, DONE, OBS_IMAGE, OBS_IMAGES, OBS_STR, REWARD
 from lerobot.utils.device_utils import get_safe_torch_device
-from lerobot.utils.eval_stats import success_summary
 from lerobot.utils.import_utils import _peft_available, register_third_party_plugins, require_package
 from lerobot.utils.io_utils import write_video
 from lerobot.utils.random_utils import set_seed
@@ -106,9 +106,9 @@ else:
 logger = logging.getLogger(__name__)
 
 
-def _env_features_to_dataset_features(env_features: dict[str, PolicyFeature]) -> dict[str, dict[str, Any]]:
+def _env_features_to_dataset_features(env_features: dict) -> dict:
     """Convert EnvConfig.features to the dict format expected by LeRobotDataset.create()."""
-    features: dict[str, dict[str, Any]] = {}
+    features = {}
     for key, ft in env_features.items():
         shape = tuple(ft.shape)
         if ft.type is FeatureType.VISUAL:
@@ -217,13 +217,8 @@ def rollout(
     """
     assert isinstance(policy, nn.Module), "Policy must be a PyTorch nn module."
 
-    # Reset the policy, its processors and the environments. The processors matter: a step that
-    # latches per-episode state -- e.g. ``RelativeActionsProcessorStep``'s cached anchor -- would
-    # otherwise carry the previous batch of episodes' value into this one.
-    # ``SyncInferenceEngine`` already does this on the robot.
+    # Reset the policy and environments.
     policy.reset()
-    preprocessor.reset()
-    postprocessor.reset()
     # NEW_ROLLOUT_OPTION tells FreezeAfterEpisodeEnd this is a genuine new episode, as
     # opposed to Gymnasium's argument-less autoreset of a sub-env that already finished.
     observation, info = env.reset(seed=seeds, options={NEW_ROLLOUT_OPTION: True})
@@ -262,18 +257,28 @@ def rollout(
     all_rewards = []
     all_successes = []
     all_dones = []
+    latest_episode_infos: list[dict[str, Any]] = [{} for _ in range(env.num_envs)]
 
-    # A relative-action policy predicts a chunk of offsets anchored to the state at prediction
-    # time, but this loop reruns the pre/post pipeline every step, which would re-anchor queued
-    # actions to the current (moved) state. Bind the step to the policy's queue depth so it holds
-    # the anchor until the chunk drains. Done here rather than in `eval_main` so that every caller
-    # of this public loop is covered; rebinding the same callable each rollout is a no-op.
-    # The anchor is [B, state_dim] and tracks exactly what the single shared action queue tracks,
-    # so it inherits the queue's batching assumptions rather than adding any: every sub-env
-    # refills on the same step, and a sub-env that finished early is frozen by
-    # FreezeAfterEpisodeEnd and its transitions discarded.
-    if bind_relative_anchor(policy, preprocessor) is not None:
-        logging.info("Relative actions enabled: chunk anchor held until the action queue drains")
+    def _normalize_info_value(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {key: _normalize_info_value(item) for key, item in value.items() if not key.startswith("_")}
+        if isinstance(value, np.ndarray):
+            return value.item() if value.ndim == 0 else value.tolist()
+        if isinstance(value, np.generic):
+            return value.item()
+        return value
+
+    def _vector_info_at(vector_info: dict[str, Any], env_idx: int) -> dict[str, Any]:
+        result = {}
+        for key, value in vector_info.items():
+            if key.startswith("_"):
+                continue
+            try:
+                item = value[env_idx] if len(value) == env.num_envs else value
+            except (TypeError, IndexError):
+                item = value
+            result[key] = _normalize_info_value(item)
+        return result
 
     step = 0
     # Keep track of which environments are done.
@@ -337,13 +342,16 @@ def rollout(
                         if hasattr(is_success, "tolist")
                         else [bool(is_success)] * env.num_envs
                     )
+                    for env_idx in range(env.num_envs):
+                        latest_episode_infos[env_idx] = _vector_info_at(final_info, env_idx)
                 else:
                     # Gymnasium < 1.0 returns final_info as a per-env sequence/object array,
                     # with entries set to a dict only for envs that just finished.
                     successes = []
-                    for item in final_info:
+                    for env_idx, item in enumerate(final_info):
                         if isinstance(item, dict) and "is_success" in item:
                             successes.append(bool(item["is_success"]))
+                            latest_episode_infos[env_idx] = _normalize_info_value(item)
                         else:
                             successes.append(False)
             elif "is_success" in info:
@@ -355,6 +363,12 @@ def rollout(
                 )
             else:
                 successes = [False] * env.num_envs
+
+            if "final_info" not in info:
+                for env_idx in range(env.num_envs):
+                    step_info = _vector_info_at(info, env_idx)
+                    if step_info:
+                        latest_episode_infos[env_idx] = step_info
 
             if recording_datasets is not None and raw_observation is not None:
                 prev_done = done.copy()
@@ -416,6 +430,7 @@ def rollout(
         "reward": torch.stack(all_rewards, dim=1),
         "success": torch.stack(all_successes, dim=1),
         "done": torch.stack(all_dones, dim=1),
+        "episode_info": latest_episode_infos,
     }
     if return_observations:
         stacked_observations = {}
@@ -446,6 +461,7 @@ def eval_policy(
     recording_repo_id: str | None = None,
     recording_private: bool = False,
     save_predicted_video: bool = False,
+    progress_path: Path | None = None,
 ) -> dict:
     """
     Args:
@@ -493,7 +509,8 @@ def eval_policy(
     sum_rewards = []
     max_rewards = []
     all_successes = []
-    all_seeds: list[int | None] = []
+    all_seeds = []
+    all_episode_infos = []
     threads = []  # for video saving threads
     n_episodes_rendered = 0  # for saving the correct number of videos
 
@@ -510,14 +527,57 @@ def eval_policy(
             # Covers AsyncVectorEnv and _LazyAsyncVectorEnv (which wraps one).
             ep_frames.append(np.stack(env.call("render")[:n_to_render_now]))
 
-    if max_episodes_rendered > 0:
-        video_paths: list[str] = []
+    video_paths: list[str] = []
 
+    predicted_video_paths: list[str] = []
     if save_predicted_video:
         if not videos_dir:
             raise ValueError("If save_predicted_video is True, videos_dir must be provided.")
-        predicted_video_paths: list[str] = []
         n_predicted_rendered = 0
+
+    def compile_info(status: str) -> dict[str, Any]:
+        completed = min(len(sum_rewards), n_episodes)
+        elapsed = time.time() - start
+        per_episode = [
+            {
+                "episode_ix": i,
+                "sum_reward": sum_reward,
+                "max_reward": max_reward,
+                "success": success,
+                "seed": seed,
+                **episode_info,
+            }
+            for i, (sum_reward, max_reward, success, seed, episode_info) in enumerate(
+                zip(
+                    sum_rewards[:completed],
+                    max_rewards[:completed],
+                    all_successes[:completed],
+                    all_seeds[:completed],
+                    all_episode_infos[:completed],
+                    strict=True,
+                )
+            )
+        ]
+        info: dict[str, Any] = {
+            "status": status,
+            "completed_episodes": completed,
+            "requested_episodes": n_episodes,
+            "per_episode": per_episode,
+            "aggregated": {
+                "avg_sum_reward": float(np.nanmean(sum_rewards[:completed])) if completed else float("nan"),
+                "avg_max_reward": float(np.nanmean(max_rewards[:completed])) if completed else float("nan"),
+                "pc_success": (
+                    float(np.nanmean(all_successes[:completed]) * 100) if completed else float("nan")
+                ),
+                "eval_s": elapsed,
+                "eval_ep_s": elapsed / max(1, completed),
+            },
+        }
+        if max_episodes_rendered > 0:
+            info["video_paths"] = list(video_paths)
+        if save_predicted_video:
+            info["predicted_video_paths"] = list(predicted_video_paths)
+        return info
 
     # Collect predicted-video latents across a rollout (world-model policies only). The latents are
     # concatenated and decoded once after the rollout, matching upstream LingBot-VA's visualization path.
@@ -582,6 +642,7 @@ def eval_policy(
         max_rewards.extend(batch_max_rewards.tolist())
         batch_successes = einops.reduce((rollout_data["success"] * mask), "b n -> b", "any")
         all_successes.extend(batch_successes.tolist())
+        all_episode_infos.extend(rollout_data.get("episode_info", [{} for _ in range(env.num_envs)]))
         if seeds:
             all_seeds.extend(seeds)
         else:
@@ -613,8 +674,6 @@ def eval_policy(
             ):
                 if n_episodes_rendered >= max_episodes_rendered:
                     break
-                if videos_dir is None:  # already validated above
-                    raise ValueError("If max_episodes_rendered > 0, videos_dir must be provided.")
 
                 videos_dir.mkdir(parents=True, exist_ok=True)
                 video_path = videos_dir / f"eval_episode_{n_episodes_rendered}.mp4"
@@ -645,8 +704,6 @@ def eval_policy(
             predicted_video = decoder(predicted_latent)
             if hasattr(predicted_video, "detach"):
                 predicted_video = predicted_video.detach().to("cpu").numpy()
-            if videos_dir is None:  # already validated above
-                raise ValueError("If save_predicted_video is True, videos_dir must be provided.")
             videos_dir.mkdir(parents=True, exist_ok=True)
             predicted_video_path = videos_dir / f"pred_episode_{n_predicted_rendered}.mp4"
             predicted_video_paths.append(str(predicted_video_path))
@@ -665,52 +722,20 @@ def eval_policy(
         progbar.set_postfix(
             {"running_success_rate": f"{np.mean(all_successes[:n_episodes]).item() * 100:.1f}%"}
         )
+        if progress_path is not None:
+            _atomic_write_json(progress_path, compile_info("in_progress"))
 
     # Wait till all video rendering threads are done.
     for thread in threads:
         thread.join()
 
     # Compile eval info.
-    success_stats = success_summary(all_successes[:n_episodes])
-    info: dict[str, Any] = {
-        "per_episode": [
-            {
-                "episode_ix": i,
-                "sum_reward": sum_reward,
-                "max_reward": max_reward,
-                "success": success,
-                "seed": seed,
-            }
-            for i, (sum_reward, max_reward, success, seed) in enumerate(
-                zip(
-                    sum_rewards[:n_episodes],
-                    max_rewards[:n_episodes],
-                    all_successes[:n_episodes],
-                    all_seeds[:n_episodes],
-                    strict=True,
-                )
-            )
-        ],
-        "aggregated": {
-            "avg_sum_reward": float(np.nanmean(sum_rewards[:n_episodes])),
-            "avg_max_reward": float(np.nanmean(max_rewards[:n_episodes])),
-            "pc_success": float(np.nanmean(all_successes[:n_episodes]) * 100),
-            "n_episodes": success_stats["n_episodes"],
-            "n_success": success_stats["n_success"],
-            "pc_success_ci95": success_stats["pc_success_ci95"],
-            "eval_s": time.time() - start,
-            "eval_ep_s": (time.time() - start) / n_episodes,
-        },
-    }
+    info = compile_info("completed")
+    if progress_path is not None:
+        _atomic_write_json(progress_path, info)
 
     if return_episode_data:
         info["episodes"] = episode_data
-
-    if max_episodes_rendered > 0:
-        info["video_paths"] = video_paths
-
-    if save_predicted_video:
-        info["predicted_video_paths"] = predicted_video_paths
 
     policy.train(was_training)
 
@@ -763,19 +788,8 @@ def _compile_episode_data(
 
 
 @parser.wrap()
-def eval_main(cfg: EvalPipelineConfig) -> None:
+def eval_main(cfg: EvalPipelineConfig):
     logging.info(pformat(asdict(cfg)))
-
-    if cfg.policy is None:
-        raise ValueError(
-            "Evaluation requires a policy: pass --policy.path=<pretrained_dir> or --policy.type=<name>."
-        )
-    if cfg.policy.device is None:
-        # PreTrainedConfig.__post_init__ always resolves the device, so reaching this is a programming error.
-        raise ValueError("Policy config has no device set.")
-    if cfg.output_dir is None:
-        # EvalPipelineConfig.__post_init__ always assigns a default output_dir.
-        raise ValueError("EvalPipelineConfig.output_dir is not set.")
 
     # Check device is available
     device = get_safe_torch_device(cfg.policy.device, log=True)
@@ -809,6 +823,20 @@ def eval_main(cfg: EvalPipelineConfig) -> None:
         "device_processor": {"device": str(policy.config.device)},
         "rename_observations_processor": {"rename_map": cfg.rename_map},
     }
+    if cfg.tokenizer_path is not None:
+        tokenizer_path = cfg.tokenizer_path.expanduser().resolve()
+        if not tokenizer_path.is_dir():
+            raise FileNotFoundError(f"Tokenizer directory not found: {tokenizer_path}")
+        if cfg.policy.type == "groot":
+            preprocessor_overrides["groot_n1_7_vlm_encode_v1"] = {
+                "model_name": str(tokenizer_path)
+            }
+            logging.info(f"Using local GR00T VLM processor assets: {tokenizer_path}")
+        else:
+            preprocessor_overrides["tokenizer_processor"] = {
+                "tokenizer_name": str(tokenizer_path)
+            }
+            logging.info(f"Using local tokenizer override: {tokenizer_path}")
 
     preprocessor, postprocessor = make_pre_post_processors(
         policy_cfg=cfg.policy,
@@ -841,18 +869,10 @@ def eval_main(cfg: EvalPipelineConfig) -> None:
             env_features=cfg.env.features if cfg.eval.recording else None,
             recording_repo_id=cfg.eval.recording_repo_id,
             recording_private=cfg.eval.recording_private,
+            progress_dir=Path(cfg.output_dir) / "progress",
         )
         logger.info("Overall Aggregated Metrics:")
         logger.info(info["overall"])
-        ci_low, ci_high = info["overall"]["pc_success_ci95"]
-        logger.info(
-            "Success rate %.1f%% (%d/%d episodes, 95%% Wilson interval %.1f%% to %.1f%%)",
-            info["overall"]["pc_success"],
-            info["overall"]["n_success"],
-            info["overall"]["n_episodes"],
-            ci_low,
-            ci_high,
-        )
 
         # Print per-suite stats
         for task_group, task_group_info in info.items():
@@ -862,8 +882,7 @@ def eval_main(cfg: EvalPipelineConfig) -> None:
     close_envs(envs)
 
     # Save info
-    with open(Path(cfg.output_dir) / "eval_info.json", "w") as f:
-        json.dump(info, f, indent=2)
+    _atomic_write_json(Path(cfg.output_dir) / "eval_info.json", info)
 
     logging.info("End of eval")
 
@@ -875,9 +894,54 @@ class TaskMetrics(TypedDict):
     successes: list[bool]
     video_paths: list[str]
     predicted_video_paths: list[str]
+    episode_infos: list[dict[str, Any]]
+    stage_metrics: dict[str, Any]
 
 
-ACC_KEYS = ("sum_rewards", "max_rewards", "successes", "video_paths", "predicted_video_paths")
+ACC_KEYS = (
+    "sum_rewards",
+    "max_rewards",
+    "successes",
+    "video_paths",
+    "predicted_video_paths",
+    "episode_infos",
+)
+
+STAGE_BOOL_KEYS = (
+    "stage_target_reached",
+    "stage_target_grasped",
+    "stage_target_lifted",
+    "stage_wrong_object_grasped",
+    "stage_placed",
+)
+
+
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = path.with_suffix(f"{path.suffix}.tmp")
+    with open(temporary_path, "w") as file:
+        json.dump(payload, file, indent=2)
+    os.replace(temporary_path, path)
+
+
+def _aggregate_stage_metrics(episode_infos: list[dict[str, Any]]) -> dict[str, Any]:
+    staged_infos = [info for info in episode_infos if any(key in info for key in STAGE_BOOL_KEYS)]
+    if not staged_infos:
+        return {}
+    result: dict[str, Any] = {"n_episodes": len(staged_infos)}
+    for key in STAGE_BOOL_KEYS:
+        values = [bool(info.get(key, False)) for info in staged_infos]
+        result[f"{key}_count"] = int(sum(values))
+        result[f"{key}_rate"] = float(np.mean(values))
+    distances = [
+        float(info["min_eef_target_distance_m"])
+        for info in staged_infos
+        if info.get("min_eef_target_distance_m") is not None
+    ]
+    lifts = [float(info.get("max_target_lift_m", 0.0)) for info in staged_infos]
+    result["avg_min_eef_target_distance_m"] = float(np.mean(distances)) if distances else None
+    result["avg_max_target_lift_m"] = float(np.mean(lifts)) if lifts else None
+    return result
 
 
 def eval_one(
@@ -897,6 +961,7 @@ def eval_one(
     env_features: dict | None = None,
     recording_repo_id: str | None = None,
     recording_private: bool = False,
+    progress_path: Path | None = None,
 ) -> TaskMetrics:
     """Evaluates one task_id of one suite using the provided vec env."""
 
@@ -918,6 +983,7 @@ def eval_one(
         env_features=env_features,
         recording_repo_id=recording_repo_id,
         recording_private=recording_private,
+        progress_path=progress_path,
     )
 
     per_episode = task_result["per_episode"]
@@ -925,6 +991,8 @@ def eval_one(
         sum_rewards=[ep["sum_reward"] for ep in per_episode],
         max_rewards=[ep["max_reward"] for ep in per_episode],
         successes=[ep["success"] for ep in per_episode],
+        episode_infos=per_episode,
+        stage_metrics=_aggregate_stage_metrics(per_episode),
         video_paths=task_result.get("video_paths", []),
         predicted_video_paths=task_result.get("predicted_video_paths", []),
     )
@@ -949,6 +1017,7 @@ def run_one(
     env_features: dict | None = None,
     recording_repo_id: str | None = None,
     recording_private: bool = False,
+    progress_dir: Path | None = None,
 ):
     """
     Run eval_one for a single (task_group, task_id, env).
@@ -983,22 +1052,13 @@ def run_one(
         env_features=env_features,
         recording_repo_id=task_repo_id,
         recording_private=recording_private,
+        progress_path=(progress_dir / f"{task_group}_{task_id}.json" if progress_dir else None),
     )
 
     if max_episodes_rendered > 0:
         metrics.setdefault("video_paths", [])
     metrics.setdefault("predicted_video_paths", [])
     return task_group, task_id, metrics
-
-
-def _task_info(task_group: str, task_id: int, metrics: dict) -> dict:
-    """One `per_task` entry: the raw per-episode metrics plus the task's success count and interval."""
-    return {
-        "task_group": task_group,
-        "task_id": task_id,
-        "metrics": metrics,
-        **success_summary(metrics.get("successes") or []),
-    }
 
 
 def eval_policy_all(
@@ -1019,6 +1079,7 @@ def eval_policy_all(
     return_episode_data: bool = False,
     start_seed: int | None = None,
     max_parallel_tasks: int = 1,
+    progress_dir: Path | None = None,
 ) -> dict:
     """
     Evaluate a nested `envs` dict: {task_group: {task_id: vec_env}}.
@@ -1055,6 +1116,7 @@ def eval_policy_all(
         _append("sum_rewards", metrics.get("sum_rewards"))
         _append("max_rewards", metrics.get("max_rewards"))
         _append("successes", metrics.get("successes"))
+        _append("episode_infos", metrics.get("episode_infos"))
         for key in ("video_paths", "predicted_video_paths"):
             paths = metrics.get(key, [])
             if paths:
@@ -1078,6 +1140,7 @@ def eval_policy_all(
         env_features=env_features,
         recording_repo_id=recording_repo_id,
         recording_private=recording_private,
+        progress_dir=progress_dir,
     )
 
     # Set the shared policy's mode before launching any workers. Restoring it
@@ -1096,7 +1159,7 @@ def eval_policy_all(
                 try:
                     tg, tid, metrics = task_runner(task_group, task_id, env)
                     _accumulate_to(tg, metrics)
-                    per_task_infos.append(_task_info(tg, tid, metrics))
+                    per_task_infos.append({"task_group": tg, "task_id": tid, "metrics": metrics})
                 finally:
                     env.close()
                     # Prefetch next task's workers *after* closing current env to prevent
@@ -1117,7 +1180,7 @@ def eval_policy_all(
                     try:
                         tg, tid, metrics = fut.result()
                         _accumulate_to(tg, metrics)
-                        per_task_infos.append(_task_info(tg, tid, metrics))
+                        per_task_infos.append({"task_group": tg, "task_id": tid, "metrics": metrics})
                     finally:
                         env.close()
     finally:
@@ -1133,31 +1196,27 @@ def eval_policy_all(
     # compute per-group aggregates
     groups_aggregated = {}
     for group, acc in group_acc.items():
-        group_success = success_summary(acc["successes"])
         groups_aggregated[group] = {
             "avg_sum_reward": _agg_from_list(acc["sum_rewards"]),
             "avg_max_reward": _agg_from_list(acc["max_rewards"]),
             "pc_success": _agg_from_list(acc["successes"]) * 100 if acc["successes"] else float("nan"),
             "n_episodes": len(acc["sum_rewards"]),
-            "n_success": group_success["n_success"],
-            "pc_success_ci95": group_success["pc_success_ci95"],
             "video_paths": list(acc["video_paths"]),
             "predicted_video_paths": list(acc["predicted_video_paths"]),
+            "stage_metrics": _aggregate_stage_metrics(acc["episode_infos"]),
         }
 
     # overall aggregates
-    overall_success = success_summary(overall["successes"])
     overall_agg = {
         "avg_sum_reward": _agg_from_list(overall["sum_rewards"]),
         "avg_max_reward": _agg_from_list(overall["max_rewards"]),
         "pc_success": _agg_from_list(overall["successes"]) * 100 if overall["successes"] else float("nan"),
         "n_episodes": len(overall["sum_rewards"]),
-        "n_success": overall_success["n_success"],
-        "pc_success_ci95": overall_success["pc_success_ci95"],
         "eval_s": time.time() - start_t,
         "eval_ep_s": (time.time() - start_t) / max(1, len(overall["sum_rewards"])),
         "video_paths": list(overall["video_paths"]),
         "predicted_video_paths": list(overall["predicted_video_paths"]),
+        "stage_metrics": _aggregate_stage_metrics(overall["episode_infos"]),
     }
 
     return {
